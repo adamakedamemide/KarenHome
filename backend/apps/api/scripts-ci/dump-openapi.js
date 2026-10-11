@@ -33,6 +33,7 @@ async function main() {
     .addTag('notifications')
     .addTag('media')
     .addTag('i18n')
+    .addTag('valuation', 'Valuation cases, lifecycle, exact-decimal results and comparable evidence (no invented parameters; IRR=TBD)')
     .addTag('admin')
     .addTag('health')
     .build();

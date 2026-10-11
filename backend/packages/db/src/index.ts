@@ -5,6 +5,7 @@ export * from './property-repository';
 export * from './listing-repository';
 export * from './crm-repository';
 export * from './projects-repository';
+export * from './valuation-repository';
 export * from './messaging-repository';
 export * from './outbox-repository';
 export * from './audit-repository';

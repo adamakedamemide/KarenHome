@@ -2255,6 +2255,218 @@
         ]
       }
     },
+    "/api/v1/valuation/cases": {
+      "post": {
+        "operationId": "ValuationController_createCase",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateValuationCaseDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Valuation"
+        ]
+      },
+      "get": {
+        "operationId": "ValuationController_listCases",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Valuation"
+        ]
+      }
+    },
+    "/api/v1/valuation/cases/{id}": {
+      "get": {
+        "operationId": "ValuationController_getCase",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Valuation"
+        ]
+      },
+      "put": {
+        "operationId": "ValuationController_updateCase",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateValuationCaseDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Valuation"
+        ]
+      }
+    },
+    "/api/v1/valuation/cases/{id}/status": {
+      "post": {
+        "operationId": "ValuationController_changeStatus",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValuationCaseStatusDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Valuation"
+        ]
+      }
+    },
+    "/api/v1/valuation/cases/{id}/result": {
+      "put": {
+        "operationId": "ValuationController_recordResult",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordValuationResultDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Valuation"
+        ]
+      }
+    },
+    "/api/v1/valuation/cases/{id}/comparables": {
+      "post": {
+        "operationId": "ValuationController_addComparables",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddComparablesDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Valuation"
+        ]
+      }
+    },
+    "/api/v1/valuation/properties/{propertyId}/cases": {
+      "get": {
+        "operationId": "ValuationController_listPropertyHistory",
+        "parameters": [
+          {
+            "name": "propertyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Valuation"
+        ]
+      }
+    },
     "/api/v1/commission/calculations": {
       "post": {
         "operationId": "CommissionController_calculate",
@@ -3410,6 +3622,10 @@
       "description": ""
     },
     {
+      "name": "valuation",
+      "description": "Valuation cases, lifecycle, exact-decimal results and comparable evidence (no invented parameters; IRR=TBD)"
+    },
+    {
       "name": "admin",
       "description": ""
     },
@@ -3565,6 +3781,26 @@
         "properties": {}
       },
       "SellUnitDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "CreateValuationCaseDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "UpdateValuationCaseDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "ValuationCaseStatusDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "RecordValuationResultDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "AddComparablesDto": {
         "type": "object",
         "properties": {}
       },
