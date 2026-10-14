@@ -1,5 +1,5 @@
-import { ForbiddenException, Injectable, NotFoundException, UnprocessableEntityException } from '@nestjs/common';
-import { AuditRepository, IamRepository, OutboxRepository, PostgresDatabase, ValuationRepository, type ValuationCaseRow, type ValuationComparableRow, type ValuationResultRow } from '@platform/db';
+import { ConflictException, ForbiddenException, Injectable, NotFoundException, UnprocessableEntityException } from '@nestjs/common';
+import { AuditRepository, IamRepository, OutboxRepository, PostgresDatabase, ValuationRepository, type ValuationCaseRow, type ValuationComparableRow, type ValuationComparableUsageRow, type ValuationResultRow } from '@platform/db';
 import type { AuthenticatedUser } from '@platform/contracts';
 
 /**
@@ -178,6 +178,38 @@ export class ValuationService {
     return this.listCases(actor, { ...filter, propertyId });
   }
 
+  /**
+   * Milestone 2 — reverse comparable traceability: which (visible) valuation cases
+   * used this property as comparable evidence. Read-only; the read-scope rule is
+   * exactly the listCases rule (binding-org members with valuation.view for the org
+   * root; otherwise the actor's active orgs + their own requests). The comparable
+   * property itself grants no access, so out-of-scope evidence can never leak;
+   * 404 only when the property does not exist at all (createCase convention).
+   */
+  async listComparableUsage(comparablePropertyId: string, actor: AuthenticatedUser, filter: {
+    organizationId?: string | undefined;
+    limit?: number | undefined;
+  } = {}): Promise<Array<Record<string, unknown>>> {
+    const property = await this.valuations.getProperty(comparablePropertyId);
+    if (!property) throw new NotFoundException({ code: 'PROPERTY_NOT_FOUND', message: 'Property not found' });
+    let rows: ValuationComparableUsageRow[];
+    if (filter.organizationId) {
+      const member = await this.iam.isActiveOrganizationMember(actor.id, filter.organizationId);
+      if (!member) throw new NotFoundException({ code: 'ORG_NOT_FOUND', message: 'Organization not found' });
+      await this.requirePermission(actor, 'valuation.view', filter.organizationId);
+      rows = await this.valuations.listCasesUsingComparable({
+        comparablePropertyId, organizationId: filter.organizationId, limit: filter.limit,
+      });
+    } else {
+      await this.requirePermission(actor, 'valuation.view');
+      const memberOrganizationIds = await this.valuations.listActiveOrganizationIds(actor.id);
+      rows = await this.valuations.listCasesUsingComparable({
+        comparablePropertyId, memberOrganizationIds, requestedByUserId: actor.id, limit: filter.limit,
+      });
+    }
+    return rows.map((r) => ({ ...this.toCaseApi(r), comparableUsage: this.toComparableUsageApi(r) }));
+  }
+
   // ---------------------------------------------------------------- case updates
 
   async updateCaseMeta(caseId: string, input: {
@@ -246,12 +278,23 @@ export class ValuationService {
       let row: ValuationCaseRow | null;
       try {
         row = await this.valuations.updateCaseStatus({
-          id: caseRow.id, toStatus, expiresAt, executor: client,
+          id: caseRow.id, toStatus, expectedFromStatus: caseRow.status, expiresAt, executor: client,
         });
       } catch (error) {
         throw ValuationService.mapCaseError(error);
       }
-      if (!row) throw new NotFoundException({ code: 'VALUATION_CASE_NOT_FOUND', message: 'Valuation case not found' });
+      if (!row) {
+        // Milestone 2 — optimistic-concurrency loser (CRM completeTask precedent):
+        // the authorized pre-read was stale — a concurrent transition moved the
+        // lifecycle state first, so the CAS UPDATE matched zero rows. The loser
+        // throws HERE, before any event/audit emission (no duplicate
+        // ValuationCompleted.v1, no duplicate audit effects) and surfaces as the
+        // established 409 conflict response — never a silent no-op success.
+        throw new ConflictException({
+          code: 'VALUATION_CASE_STATUS_CONFLICT',
+          message: `valuation case lifecycle moved concurrently (expected ${caseRow.status}); re-read the case and retry`,
+        });
+      }
       // Registered event catalogue (design review §10) — same transaction.
       if (toStatus === 'completed') {
         const result = await this.valuations.getResultByCaseId(caseRow.id, client);
@@ -458,6 +501,14 @@ export class ValuationService {
       comparablePropertyId: c.comparable_property_id, comparableListingId: c.comparable_listing_id,
       similarityScore: c.similarity_score, distanceM: c.distance_m, adjustedPrice: c.adjusted_price,
       currencyCode: c.currency_code,
+    };
+  }
+
+  private toComparableUsageApi(u: ValuationComparableUsageRow): Record<string, unknown> {
+    return {
+      resultId: u.usage_result_id, similarityScore: u.usage_similarity_score,
+      distanceM: u.usage_distance_m, adjustedPrice: u.usage_adjusted_price,
+      currencyCode: u.usage_currency_code,
     };
   }
 

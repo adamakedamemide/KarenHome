@@ -1,5 +1,5 @@
 import { describe, expect, it, jest, beforeEach } from '@jest/globals';
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { ValuationService } from '../src/modules/valuation/application/valuation.service';
 import type { AuthenticatedUser } from '@platform/contracts';
 
@@ -38,6 +38,7 @@ function makeRepo(overrides: Record<string, LooseMock> = {}) {
     upsertResult: mockFn(async () => ({ ...resultRow })),
     listComparables: mockFn(async () => [{ ...comparableRow }]),
     addComparable: mockFn(async () => ({ ...comparableRow })),
+    listCasesUsingComparable: mockFn(async () => []),
   };
   return Object.assign(repo, overrides);
 }
@@ -265,5 +266,54 @@ describe('G5.1 Valuation service (unit, mocked repositories)', () => {
     const { service, repo } = makeService();
     await service.listPropertyCaseHistory('prop-1', full, { organizationId: 'org-1' });
     expect(repo.listCases).toHaveBeenCalledWith(expect.objectContaining({ propertyId: 'prop-1', organizationId: 'org-1' }));
+  });
+
+  it('V21 (M2) — losing finalizer: CAS null maps to 409 conflict; the loser emits no event and no audit', async () => {
+    const { service, repo, outbox, audit } = makeService(makeRepo({
+      getCase: mockFn(async () => ({ ...caseRow, status: 'processing' })),
+      updateCaseStatus: mockFn(async () => null), // a concurrent finalizer committed first → CAS matched 0 rows
+    }));
+    await expect(service.changeCaseStatus('case-1', 'completed', full))
+      .rejects.toBeInstanceOf(ConflictException);
+    await expect(service.changeCaseStatus('case-1', 'completed', full))
+      .rejects.toMatchObject({ response: { code: 'VALUATION_CASE_STATUS_CONFLICT' } });
+    // the CAS guard uses the authorized pre-read as the expected from-status
+    expect(repo.updateCaseStatus).toHaveBeenCalledWith(expect.objectContaining({ expectedFromStatus: 'processing', toStatus: 'completed' }));
+    // the loser throws before any emission — no duplicate ValuationCompleted.v1, no audit effects
+    expect(outbox.append).not.toHaveBeenCalled();
+    expect(audit.append).not.toHaveBeenCalled();
+  });
+
+  it('V22 (M2) — reverse comparable traceability: roots, 404s, and evidence-shaped items', async () => {
+    const usageRow = {
+      ...caseRow,
+      usage_result_id: 'res-1', usage_similarity_score: '91.00', usage_distance_m: '350.25',
+      usage_adjusted_price: '148000.0000', usage_currency_code: 'USD',
+    };
+    const { service, repo, iam } = makeService(makeRepo({
+      listCasesUsingComparable: mockFn(async () => [usageRow]),
+    }));
+    // org root: binding-org member with valuation.view
+    const items = await service.listComparableUsage('prop-2', full, { organizationId: 'org-1' }) as Array<Record<string, unknown>>;
+    expect(iam.isActiveOrganizationMember).toHaveBeenCalledWith('user-1', 'org-1');
+    expect(repo.listCasesUsingComparable).toHaveBeenCalledWith(expect.objectContaining({ comparablePropertyId: 'prop-2', organizationId: 'org-1' }));
+    expect(items).toHaveLength(1);
+    expect(items[0]!['id']).toBe('case-1');
+    expect(items[0]!['comparableUsage']).toMatchObject({ resultId: 'res-1', similarityScore: '91.00', distanceM: '350.25', adjustedPrice: '148000.0000', currencyCode: 'USD' });
+    // global root = active orgs + own requests (same read-scope rule as listCases)
+    await service.listComparableUsage('prop-2', full, {});
+    expect(repo.listCasesUsingComparable).toHaveBeenLastCalledWith(expect.objectContaining({ memberOrganizationIds: ['org-1'], requestedByUserId: 'user-1' }));
+    // unknown property → 404 (createCase convention)
+    const s2 = makeService(makeRepo({ getProperty: mockFn(async () => null) }));
+    await expect(s2.service.listComparableUsage('prop-x', full, {}))
+      .rejects.toMatchObject({ response: { code: 'PROPERTY_NOT_FOUND' } });
+    // non-member org → 404 without leak
+    const s3 = makeService(makeRepo({ listCasesUsingComparable: mockFn(async () => [usageRow]) }), { member: false });
+    await expect(s3.service.listComparableUsage('prop-2', full, { organizationId: 'org-1' }))
+      .rejects.toMatchObject({ response: { code: 'ORG_NOT_FOUND' } });
+    // valuation.view is required
+    const s4 = makeService(makeRepo(), { permissions: [] });
+    await expect(s4.service.listComparableUsage('prop-2', full, {}))
+      .rejects.toBeInstanceOf(ForbiddenException);
   });
 });

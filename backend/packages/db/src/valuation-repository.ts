@@ -56,6 +56,30 @@ export interface ValuationComparableRow {
   currency_code: string;
 }
 
+/**
+ * Milestone 2 — one answer row of the reverse comparable traceability: a case
+ * that used the queried property as comparable evidence, flattened case columns
+ * plus the evidence linkage (usage_* aliases; all money values stay strings).
+ */
+export interface ValuationComparableUsageRow {
+  id: string;
+  property_id: string;
+  requested_by_user_id: string | null;
+  status: string;
+  method: string;
+  model_version: string | null;
+  organization_id: string;
+  requested_at: Date;
+  completed_at: Date | null;
+  expires_at: Date | null;
+  updated_at: Date;
+  usage_result_id: string;
+  usage_similarity_score: string | null;
+  usage_distance_m: string | null;
+  usage_adjusted_price: string | null;
+  usage_currency_code: string;
+}
+
 const CASE_COLS = `id, property_id, requested_by_user_id, status::text AS status, method, model_version,
   organization_id, requested_at, completed_at, expires_at, updated_at`;
 
@@ -214,10 +238,20 @@ export class ValuationRepository {
     return r.rows[0] ?? null;
   }
 
-  /** Transition authority stays in the DB (0040 triggers); this only carries the payload. */
+  /**
+   * Transition authority stays in the DB (0040 triggers); this only carries the payload.
+   *
+   * Milestone 2 — optimistic concurrency (CRM completeTask precedent): the UPDATE fires
+   * only while the lifecycle state still equals the authorized pre-read
+   * (expectedFromStatus). Under READ COMMITTED a concurrent transition that committed
+   * first makes the row-level predicate re-check fail after the lock wait, so exactly
+   * ONE finalizer wins; zero rows = this caller lost the race and maps that to the
+   * established 409 conflict response (never a silent no-op, never duplicate effects).
+   */
   async updateCaseStatus(input: {
     id: string;
     toStatus: string;
+    expectedFromStatus: string;
     expiresAt?: Date | null | undefined;
     executor?: QueryExecutor | undefined;
   }): Promise<ValuationCaseRow | null> {
@@ -226,9 +260,9 @@ export class ValuationRepository {
       `UPDATE valuation.cases
           SET status = $2::valuation.valuation_status,
               expires_at = COALESCE($3::timestamptz, expires_at)
-        WHERE id = $1::uuid
+        WHERE id = $1::uuid AND status = $4::valuation.valuation_status
         RETURNING ${CASE_COLS}`,
-      [input.id, input.toStatus, input.expiresAt ?? null],
+      [input.id, input.toStatus, input.expiresAt ?? null, input.expectedFromStatus],
     );
     return r.rows[0] ?? null;
   }
@@ -281,6 +315,64 @@ export class ValuationRepository {
         WHERE valuation_result_id = $1::uuid
         ORDER BY comparable_property_id ASC`,
       [resultId],
+    );
+    return r.rows;
+  }
+
+  /**
+   * Milestone 2 — reverse comparable traceability: "which valuation cases used
+   * property X as a comparable?". Reads ONLY the frozen schema through the
+   * comparables → results → cases join path (one result per case, comparables PK
+   * (valuation_result_id, comparable_property_id) ⇒ at most one row per case, no
+   * DISTINCT needed); the equality on comparable_property_id is served by the 0040
+   * G7 traceability index idx_valuation_comparables_property. No new data model,
+   * no migration.
+   *
+   * Access-root discipline is identical to listCases — exactly one supported root
+   * (organizationId | memberOrganizationIds(+requester) | requestedByUserId); without
+   * a root the answer is a deterministic empty scope. The comparable property itself
+   * never grants read access, so cross-organization evidence cannot leak.
+   */
+  async listCasesUsingComparable(filter: {
+    comparablePropertyId: string;
+    organizationId?: string | undefined;
+    memberOrganizationIds?: string[] | undefined;
+    requestedByUserId?: string | undefined;
+    limit?: number | undefined;
+  }): Promise<ValuationComparableUsageRow[]> {
+    const limit = Math.min(Math.max(filter.limit ?? 50, 1), 200);
+    let accessRoot: string | null = null;
+    const params: unknown[] = [filter.comparablePropertyId];
+    if (filter.organizationId) {
+      params.push(filter.organizationId);
+      accessRoot = `cs.organization_id = $${params.length}::uuid`;
+    } else if (filter.memberOrganizationIds && filter.memberOrganizationIds.length > 0) {
+      params.push(filter.memberOrganizationIds);
+      const orgs = `cs.organization_id = ANY($${params.length}::uuid[])`;
+      params.push(filter.requestedByUserId ?? null);
+      accessRoot = `(${orgs} OR cs.requested_by_user_id = $${params.length}::uuid)`;
+    } else if (filter.requestedByUserId) {
+      params.push(filter.requestedByUserId);
+      accessRoot = `cs.requested_by_user_id = $${params.length}::uuid`;
+    }
+    if (!accessRoot) {
+      // No access root → deterministic empty scope (never a full-table read).
+      return [];
+    }
+    params.push(limit);
+    const r = await this.db.query<ValuationComparableUsageRow>(
+      `SELECT cs.id, cs.property_id, cs.requested_by_user_id, cs.status::text AS status, cs.method,
+              cs.model_version, cs.organization_id, cs.requested_at, cs.completed_at, cs.expires_at, cs.updated_at,
+              c.valuation_result_id AS usage_result_id, c.similarity_score AS usage_similarity_score,
+              c.distance_m AS usage_distance_m, c.adjusted_price AS usage_adjusted_price,
+              c.currency_code AS usage_currency_code
+         FROM valuation.comparables c
+         JOIN valuation.results r ON r.id = c.valuation_result_id
+         JOIN valuation.cases cs ON cs.id = r.case_id
+        WHERE c.comparable_property_id = $1::uuid AND ${accessRoot}
+        ORDER BY cs.requested_at DESC, cs.id ASC
+        LIMIT $${params.length}`,
+      params,
     );
     return r.rows;
   }

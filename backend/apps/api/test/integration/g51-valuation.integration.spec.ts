@@ -341,4 +341,139 @@ d('G5.1 Valuation — integration against real PostgreSQL (Gate 5.1 Phase E)', (
     expect(corrected['estimatedValue']).toBe('25.0000');
     expect(corrected['confidence']).toBe('60.00');
   });
+
+  // ------------------------------------------------------------------ Milestone 2
+
+  it('M2-R1 — reverse comparable traceability: org-scoped, leak-free, exact decimal evidence', async () => {
+    const f1 = await fixture();
+    const f2 = await fixture(); // second org + member (outsider perspective)
+    const targetPropertyId = f1.propertyId; // the property used AS comparable evidence
+    const anchorPropertyId = f2.propertyId; // the case's own anchor property
+
+    const created = (await service.createCase({ organizationId: f1.orgId, propertyId: anchorPropertyId }, f1.actor)) as { id: string };
+    createdCaseIds.push(created.id);
+    await service.changeCaseStatus(created.id, 'processing', f1.actor);
+    await service.recordResult(created.id, { minValue: '100000.0000', estimatedValue: '150000.0000', maxValue: '200000.0000', currencyCode: 'USD' }, f1.actor);
+    await service.addComparables(created.id, [{ comparablePropertyId: targetPropertyId, similarityScore: '91.00', distanceM: '350.25', adjustedPrice: '148000.1234' }], f1.actor);
+    await service.changeCaseStatus(created.id, 'completed', f1.actor);
+
+    // org root: the binding-org member sees the case + the evidence linkage
+    const own = (await service.listComparableUsage(targetPropertyId, f1.actor, { organizationId: f1.orgId })) as Array<Record<string, unknown>>;
+    expect(own).toHaveLength(1);
+    expect(own[0]!['id']).toBe(created.id);
+    expect(own[0]!['status']).toBe('completed');
+    const ownUsage = own[0]!['comparableUsage'] as Record<string, unknown>;
+    expect(ownUsage).toMatchObject({ resultId: expect.any(String), similarityScore: '91.00', distanceM: '350.25', adjustedPrice: '148000.1234', currencyCode: 'USD' });
+    expect(typeof ownUsage['adjustedPrice']).toBe('string'); // exact decimal stays a string
+
+    // global root: member orgs + own requests — same rule as listCases
+    const global = (await service.listComparableUsage(targetPropertyId, f1.actor, {})) as Array<Record<string, unknown>>;
+    expect(global.map((r) => r['id'])).toContain(created.id);
+
+    // cross-organization leak prevention: the outsider sees nothing (org root AND global root)
+    const leakOrg = (await service.listComparableUsage(targetPropertyId, f2.actor, { organizationId: f2.orgId })) as Array<Record<string, unknown>>;
+    expect(leakOrg).toEqual([]);
+    const leakGlobal = (await service.listComparableUsage(targetPropertyId, f2.actor, {})) as Array<Record<string, unknown>>;
+    expect(leakGlobal).toEqual([]);
+
+    // existing property never used as a comparable → empty, not 404
+    const none = (await service.listComparableUsage(anchorPropertyId, f1.actor, { organizationId: f1.orgId })) as Array<Record<string, unknown>>;
+    expect(none).toEqual([]);
+
+    // unknown property → 404 PROPERTY_NOT_FOUND
+    await expect(service.listComparableUsage(randomUUID(), f1.actor, {}))
+      .rejects.toMatchObject({ response: { code: 'PROPERTY_NOT_FOUND' } });
+  });
+
+  it('M2-R2 — exactly-one-finalizer: stale finalizer gets 409; no duplicate event, no duplicate audit (real DB CAS)', async () => {
+    const f = await fixture();
+    const created = (await service.createCase({ organizationId: f.orgId, propertyId: f.propertyId }, f.actor)) as { id: string };
+    createdCaseIds.push(created.id);
+    await service.changeCaseStatus(created.id, 'processing', f.actor);
+    await service.recordResult(created.id, { minValue: '10.0000', estimatedValue: '20.0000', maxValue: '30.0000', currencyCode: 'USD' }, f.actor);
+
+    // winner: the eligible finalizer that commits first
+    await service.changeCaseStatus(created.id, 'completed', f.actor);
+    expect(await eventCount('ValuationCompleted.v1', created.id)).toBe(1);
+    expect(await auditCount('valuation.case_status_changed', created.id)).toBe(2); // processing + completed
+
+    // stale finalizer: its authorized pre-read still shows the pre-finalize state
+    // (exactly what happens under concurrency); the committed row is already
+    // completed → the CAS UPDATE (WHERE status = expected) matches 0 rows → 409.
+    const originalGetCase = repo.getCase.bind(repo);
+    (repo as unknown as { getCase?: unknown }).getCase = async (id: string) => {
+      const row = await originalGetCase(id);
+      return row && row.status === 'completed' ? { ...row, status: 'processing' } : row;
+    };
+    try {
+      await expect(service.changeCaseStatus(created.id, 'completed', f.actor))
+        .rejects.toMatchObject({ status: 409, response: { code: 'VALUATION_CASE_STATUS_CONFLICT' } });
+    } finally {
+      delete (repo as unknown as { getCase?: unknown }).getCase;
+    }
+    // the loser emitted nothing and the case was not silently mutated
+    expect(await eventCount('ValuationCompleted.v1', created.id)).toBe(1);
+    expect(await auditCount('valuation.case_status_changed', created.id)).toBe(2);
+    const statusRow = await db.query<{ status: string }>(`SELECT status::text AS status FROM valuation.cases WHERE id = $1::uuid`, [created.id]);
+    expect(statusRow.rows[0]!.status).toBe('completed');
+
+    // sequential duplicate finalize keeps the established no-op rejection (never silent success)
+    await expect(service.changeCaseStatus(created.id, 'completed', f.actor))
+      .rejects.toMatchObject({ response: { code: 'VALUATION_NO_OP_TRANSITION' } });
+  });
+
+  it('M2-R3 — two concurrent CAS finalizers: exactly one UPDATE matches; the loser emits nothing (lock-wait proven)', async () => {
+    const f = await fixture();
+    const created = (await service.createCase({ organizationId: f.orgId, propertyId: f.propertyId }, f.actor)) as { id: string };
+    createdCaseIds.push(created.id);
+    await service.changeCaseStatus(created.id, 'processing', f.actor);
+    await service.recordResult(created.id, { minValue: '10.0000', estimatedValue: '20.0000', maxValue: '30.0000', currencyCode: 'USD' }, f.actor);
+
+    const db2 = new PostgresDatabase({ connectionString: process.env.DATABASE_URL!, max: 2 });
+    try {
+      let loserStarted = () => {};
+      const loserStartedP = new Promise<void>((resolve) => { loserStarted = resolve; });
+      // Winner transaction: the CAS UPDATE takes the row lock and holds it while the
+      // loser's CAS UPDATE queues behind it; event + audit are written in the SAME
+      // transaction (service parity) and commit atomically with the transition.
+      const winnerP = db.transaction(async (clientA) => {
+        const winner = await repo.updateCaseStatus({ id: created.id, toStatus: 'completed', expectedFromStatus: 'processing', executor: clientA });
+        expect(winner).toBeTruthy();
+        await loserStartedP;
+        await new Promise((resolve) => setTimeout(resolve, 200)); // hold the row lock so the loser blocks on it
+        const result = await repo.getResultByCaseId(created.id, clientA);
+        await outbox.append({
+          aggregateType: 'valuation_case', aggregateId: created.id, eventType: 'ValuationCompleted.v1', eventVersion: 1,
+          payload: { caseId: created.id, resultId: result?.id ?? null },
+        }, clientA);
+        await audit.append({
+          actorUserId: f.actor.id, organizationId: f.orgId,
+          action: 'valuation.case_status_changed', entityType: 'valuation.case', entityId: created.id,
+          beforeData: { status: 'processing' }, afterData: { status: 'completed' },
+        }, clientA);
+        return winner;
+      });
+      // Loser transaction: same expected from-status — after the winner commits,
+      // READ COMMITTED re-checks the predicate on the new row version → 0 rows.
+      const loserP = db2.transaction(async (clientB) => {
+        loserStarted();
+        return repo.updateCaseStatus({ id: created.id, toStatus: 'completed', expectedFromStatus: 'processing', executor: clientB });
+      });
+      const [winner, loser] = await Promise.all([winnerP, loserP]);
+      expect(winner).toBeTruthy();
+      expect(loser).toBeNull(); // loser's CAS matched 0 rows → upstream maps to 409
+      // exactly one completion event and one finalize audit — the loser emitted nothing
+      expect(await eventCount('ValuationCompleted.v1', created.id)).toBe(1);
+      const auditRows = await db.query<{ count: string }>(
+        `SELECT count(*) AS count FROM audit.logs
+          WHERE action = 'valuation.case_status_changed' AND entity_id = $1::uuid AND after_data->>'status' = 'completed'`,
+        [created.id],
+      );
+      expect(Number(auditRows.rows[0]!.count)).toBe(1);
+      const statusRow = await db.query<{ status: string }>(`SELECT status::text AS status FROM valuation.cases WHERE id = $1::uuid`, [created.id]);
+      expect(statusRow.rows[0]!.status).toBe('completed');
+    } finally {
+      await db2.close();
+    }
+  });
 });

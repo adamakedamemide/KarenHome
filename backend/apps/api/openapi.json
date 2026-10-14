@@ -2467,6 +2467,29 @@
         ]
       }
     },
+    "/api/v1/valuation/properties/{propertyId}/used-as-comparable": {
+      "get": {
+        "operationId": "ValuationController_listUsedAsComparable",
+        "parameters": [
+          {
+            "name": "propertyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Valuation"
+        ]
+      }
+    },
     "/api/v1/commission/calculations": {
       "post": {
         "operationId": "CommissionController_calculate",

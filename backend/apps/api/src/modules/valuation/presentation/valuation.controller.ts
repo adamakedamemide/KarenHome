@@ -119,4 +119,15 @@ export class ValuationController {
   async listPropertyHistory(@Param('propertyId') propertyId: string, @Query() query: ListPropertyValuationCasesQuery, @CurrentUser() user: AuthenticatedUser) {
     return { data: await this.valuations.listPropertyCaseHistory(propertyId, user, query) };
   }
+
+  /**
+   * Milestone 2 — reverse comparable traceability (read-only):
+   * "which valuation cases used this property as a comparable?".
+   * Same read-scope rule as the case list; evidence rows are returned only
+   * through cases the caller is allowed to see.
+   */
+  @Get('properties/:propertyId/used-as-comparable')
+  async listUsedAsComparable(@Param('propertyId') propertyId: string, @Query() query: ListPropertyValuationCasesQuery, @CurrentUser() user: AuthenticatedUser) {
+    return { data: await this.valuations.listComparableUsage(propertyId, user, query) };
+  }
 }
