@@ -2752,6 +2752,76 @@
         ]
       }
     },
+    "/api/v1/rental/leases/{id}/schedules/{scheduleId}/payments": {
+      "post": {
+        "operationId": "RentalController_recordRentPayment",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scheduleId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordRentPaymentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      },
+      "get": {
+        "operationId": "RentalController_listRentPayments",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scheduleId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      }
+    },
     "/api/v1/commission/calculations": {
       "post": {
         "operationId": "CommissionController_calculate",
@@ -4110,6 +4180,10 @@
         "properties": {}
       },
       "AddRentSchedulesDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "RecordRentPaymentDto": {
         "type": "object",
         "properties": {}
       },

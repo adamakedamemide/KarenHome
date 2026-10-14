@@ -16,8 +16,13 @@ import { PostgresDatabase, type QueryExecutor } from './postgres-database';
  *                            name/contact snapshots.
  *   rental.rent_schedules  — per-lease due dates with exact decimal amounts and an
  *                            explicit currency FK; UNIQUE (lease_id, due_date).
- *   rental.rent_payments   — NOT written by Milestone 1 (payments/ledger = next
- *                            milestone); only its RESTRICT FK guards schedule deletes.
+ *   rental.rent_payments   — Milestone 2 writes confirmed receipts here through
+ *                            the methods below (record + reconcile in ONE
+ *                            transaction). The frozen RESTRICT FK guards
+ *                            schedule deletes; the 0042 unique partial index
+ *                            ux_rent_payments_external_payment is the
+ *                            concurrency-safe idempotency authority for
+ *                            external billing payment references.
  *
  * Money/decimal columns are NEVER converted through JS numbers: pg returns
  * numeric as string and this repository keeps them strings end-to-end.
@@ -64,6 +69,16 @@ export interface RentScheduleRow {
   currency_code: string;
   status: string;
   paid_at: Date | null;
+}
+
+export interface RentPaymentRow {
+  id: string;
+  schedule_id: string;
+  amount: string;
+  currency_code: string;
+  external_payment_id: string | null;
+  paid_at: Date | null;
+  created_at: Date;
 }
 
 const LEASE_COLS = `id, property_id, source_listing_id, contract_id, landlord_user_id, landlord_organization_id,
@@ -439,6 +454,139 @@ export class RentalRepository {
       `DELETE FROM rental.rent_schedules WHERE lease_id = $1::uuid AND id = $2::uuid
        RETURNING ${SCHEDULE_COLS}`,
       [leaseId, scheduleId],
+    );
+    return r.rows[0] ?? null;
+  }
+
+  // ---------------------------------------------------------------- rent payments (Milestone 2)
+
+  /**
+   * Lock the schedule row FOR UPDATE inside the recording transaction. This is
+   * the row-level concurrency guard for same-schedule updates: concurrent
+   * payment INSERTs take FOR KEY SHARE on the schedule row (frozen FK), which
+   * conflicts with FOR UPDATE — so concurrent recorders serialize here and each
+   * re-reads a committed state before validating (no lost reconciliation, no
+   * double 'paid', overpayment deterministically rejected by the loser).
+   */
+  async getRentScheduleLocked(leaseId: string, scheduleId: string, executor: QueryExecutor = this.db): Promise<RentScheduleRow | null> {
+    const r = await executor.query<RentScheduleRow>(
+      `SELECT ${SCHEDULE_COLS} FROM rental.rent_schedules WHERE lease_id = $1::uuid AND id = $2::uuid FOR UPDATE`,
+      [leaseId, scheduleId],
+    );
+    return r.rows[0] ?? null;
+  }
+
+  /**
+   * Exact SUM over the schedule's recorded payments. PG numeric addition is
+   * exact (no float ever enters the pipeline); the result is a numeric string.
+   */
+  async sumRentPayments(scheduleId: string, executor: QueryExecutor = this.db): Promise<string> {
+    const r = await executor.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount), 0)::text AS total FROM rental.rent_payments WHERE schedule_id = $1::uuid`,
+      [scheduleId],
+    );
+    return r.rows[0]!.total;
+  }
+
+  async insertRentPayment(input: {
+    scheduleId: string;
+    amount: string;
+    currencyCode: string;
+    paidAt?: string | null | undefined;
+    executor?: QueryExecutor | undefined;
+  }): Promise<RentPaymentRow> {
+    const ex = input.executor ?? this.db;
+    // external_payment_id stays NULL in Milestone 2 (the frozen column exists,
+    // but the billing schema provides no rent-specific provenance link — see
+    // RentalService.recordRentPayment). COALESCE keeps 'paid at' explicit: the
+    // frozen column has no DEFAULT.
+    const r = await ex.query<RentPaymentRow>(
+      `INSERT INTO rental.rent_payments (schedule_id, amount, currency_code, external_payment_id, paid_at)
+       VALUES ($1::uuid, $2::numeric, $3::char(3), NULL::uuid, COALESCE($4::timestamptz, now()))
+       RETURNING id, schedule_id, amount::text AS amount, currency_code, external_payment_id, paid_at, created_at`,
+      [input.scheduleId, input.amount, input.currencyCode, input.paidAt ?? null],
+    );
+    const row = r.rows[0];
+    if (!row) throw new Error('RENT_PAYMENT_INSERT_FAILED');
+    return row;
+  }
+
+  async listRentPayments(scheduleId: string, executor: QueryExecutor = this.db): Promise<RentPaymentRow[]> {
+    const r = await executor.query<RentPaymentRow>(
+      `SELECT id, schedule_id, amount::text AS amount, currency_code, external_payment_id, paid_at, created_at
+         FROM rental.rent_payments
+        WHERE schedule_id = $1::uuid
+        ORDER BY paid_at DESC NULLS LAST, created_at ASC, id ASC`,
+      [scheduleId],
+    );
+    return r.rows;
+  }
+
+  async getRentPayment(scheduleId: string, paymentId: string, executor: QueryExecutor = this.db): Promise<RentPaymentRow | null> {
+    const r = await executor.query<RentPaymentRow>(
+      `SELECT id, schedule_id, amount::text AS amount, currency_code, external_payment_id, paid_at, created_at
+         FROM rental.rent_payments WHERE schedule_id = $1::uuid AND id = $2::uuid`,
+      [scheduleId, paymentId],
+    );
+    return r.rows[0] ?? null;
+  }
+
+  /**
+   * Reconcile the schedule from confirmed payment facts: the new status is
+   * written together with the payment row in the SAME transaction. paid_at is
+   * set only when the schedule becomes fully 'paid' (the completing receipt's
+   * paid_at); the frozen rent_payment_status enum is the vocabulary authority.
+   */
+  async updateRentScheduleStatus(input: {
+    scheduleId: string;
+    toStatus: string;
+    paidAt?: Date | null | undefined;
+    executor?: QueryExecutor | undefined;
+  }): Promise<RentScheduleRow | null> {
+    const ex = input.executor ?? this.db;
+    const r = await ex.query<RentScheduleRow>(
+      `UPDATE rental.rent_schedules
+          SET status = $2::rental.rent_payment_status, paid_at = $3::timestamptz
+        WHERE id = $1::uuid
+        RETURNING ${SCHEDULE_COLS}`,
+      [input.scheduleId, input.toStatus, input.paidAt ?? null],
+    );
+    return r.rows[0] ?? null;
+  }
+
+  // ---------------------------------------------------------------- external billing payment provenance (Milestone 2)
+
+  /**
+   * The complete billing-side provenance row for an external payment reference:
+   * the frozen billing.payments row plus its owning billing.orders row
+   * (payments.order_id is NOT NULL — every payment belongs to exactly one
+   * order). Amounts/currencies are exact numeric strings; statuses are the
+   * frozen billing.payment_status / billing.order_status vocabularies. The
+   * frozen billing schema has NO rent-specific link to rental (no lease or
+   * schedule reference anywhere in billing.orders / payments / order_items) —
+   * ownership + status + amount/currency equality is ALL the repository
+   * evidence that exists, which is why the service fails closed (see service).
+   */
+  async getBillingPaymentWithOrder(paymentId: string, executor: QueryExecutor = this.db): Promise<{
+    id: string;
+    order_id: string;
+    amount: string;
+    currency_code: string;
+    status: string;
+    order_status: string;
+    order_user_id: string | null;
+    order_organization_id: string | null;
+  } | null> {
+    const r = await executor.query<{
+      id: string; order_id: string; amount: string; currency_code: string;
+      status: string; order_status: string; order_user_id: string | null; order_organization_id: string | null;
+    }>(
+      `SELECT p.id, p.order_id, p.amount::text AS amount, p.currency_code, p.status::text AS status,
+              o.status::text AS order_status, o.user_id AS order_user_id, o.organization_id AS order_organization_id
+         FROM billing.payments p
+         JOIN billing.orders o ON o.id = p.order_id
+        WHERE p.id = $1::uuid`,
+      [paymentId],
     );
     return r.rows[0] ?? null;
   }

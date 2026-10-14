@@ -1,5 +1,5 @@
 import { ConflictException, ForbiddenException, Injectable, NotFoundException, UnprocessableEntityException } from '@nestjs/common';
-import { AuditRepository, IamRepository, OutboxRepository, PostgresDatabase, RentalRepository, type RentalLeasePartyRow, type RentalLeaseRow, type RentScheduleRow } from '@platform/db';
+import { AuditRepository, IamRepository, OutboxRepository, PostgresDatabase, RentalRepository, type RentalLeasePartyRow, type RentalLeaseRow, type RentPaymentRow, type RentScheduleRow } from '@platform/db';
 import type { AuthenticatedUser } from '@platform/contracts';
 
 /**
@@ -36,13 +36,61 @@ import type { AuthenticatedUser } from '@platform/contracts';
  *   Audit                → audit.logs before/after rows in the same transaction
  *                         as every mutation.
  *
+ * Milestone 2 (rent payments) adds, on the SAME layering discipline:
+ *   DB (frozen 0018 + additive 0042)
+ *                      → rent_payments amount CHECK (> 0), the payment-vs-
+ *                         schedule currency trigger (trg_rent_payment_currency),
+ *                         the RESTRICT FK guarding schedule deletes and the 0042
+ *                         unique partial index ux_rent_payments_external_payment
+ *                         (the concurrency-safe "same external billing payment
+ *                         can never be applied twice" idempotency authority).
+ *   Service rule       → the exact numeric(20,4) amount contract
+ *                         (assertPositiveDecimalString — Review Fix 1: at most
+ *                         4 fractional digits, at most 16 integer digits after
+ *                         deterministic leading-zero handling, strictly
+ *                         positive; a value that would need rounding is
+ *                         REJECTED, never rounded or truncated), the schedule
+ *                         status gate (receipts reconcile scheduled | pending |
+ *                         late | partially_paid; waived/cancelled are NEVER
+ *                         reopened — no grace periods, nothing is ever marked
+ *                         'late' automatically), overpayment rejection (exact
+ *                         string comparison — never capped, split, refunded or
+ *                         absorbed) and payment-fact-derived reconciliation
+ *                         (paid / partially_paid from the exact paid total,
+ *                         written in the SAME transaction as the payment row —
+ *                         a failed transaction leaves NO payment row, NO outbox
+ *                         event and NO audit record).
+ *   External provenance (Review Fix 2) → an externalPaymentId is verified
+ *                         against the real frozen billing evidence: the payment
+ *                         must exist, be 'succeeded' (an unsuccessful billing
+ *                         payment can never become a completed rent receipt),
+ *                         match the schedule currency and the receipt amount
+ *                         exactly, carry a 'paid' order, and that order must be
+ *                         owned by the lease tenant (billing.orders.user_id /
+ *                         organization_id — the applicable identity model).
+ *                         The frozen billing schema provides NO rent-specific
+ *                         link between billing orders and rental leases (no
+ *                         lease/schedule reference exists in billing.orders,
+ *                         billing.payments or billing.order_items, and no
+ *                         application convention creates rent orders), so
+ *                         rent-payment intent can NOT be established from
+ *                         amount/currency/status matching — the external path
+ *                         FAILS CLOSED with RENT_PAYMENT_EXTERNAL_PROVENANCE_
+ *                         UNVERIFIABLE and manual recording of an
+ *                         already-confirmed receipt (without externalPaymentId)
+ *                         remains the supported model. Documented limitation;
+ *                         no payment-provider transaction is ever initiated.
+ *
  * Scope lock: no FX conversion, no rent escalation, no late fees, no tax rates,
  * no deposit percentages, no renewal notice periods, no jurisdiction-specific
- * legal conditions, no electronic-signature claims, no ledger posting (the
- * billing ledger model is NOT written by Milestone 1 — rent payments, deposits
- * accounting and schedule status transitions are registered next-milestone
- * scope). Money is exact decimal end-to-end: numeric strings in, numeric(20,4)
- * in the DB, numeric strings out. Date columns are exact 'YYYY-MM-DD' strings.
+ * legal conditions, no electronic-signature claims, no ledger posting and no
+ * deposit accounting (the frozen billing ledger model defines no account
+ * mapping, ownership rules or reversal behavior for rent deposits — recorded
+ * as explicit unresolved scope), no payment-provider initiation, no invented
+ * rent-intent inference. Money is exact decimal end-to-end: numeric strings
+ * in, numeric(20,4) in the DB, numeric strings out — a single canonical value
+ * flows into comparisons, persistence, audit and events. Date columns are
+ * exact 'YYYY-MM-DD' strings.
  */
 
 const LEASE_STATUSES = ['draft', 'pending_signature', 'active', 'expired', 'terminated', 'cancelled'] as const;
@@ -59,6 +107,96 @@ const LEASE_TRANSITIONS: Record<string, readonly string[]> = {
 
 /** Pre-commencement states in which lease meta/parties/schedules stay mutable. */
 const MUTABLE_LEASE_STATUSES: readonly string[] = ['draft', 'pending_signature'];
+
+/**
+ * Schedule statuses a rent receipt can be recorded against (Milestone 2).
+ * 'waived' / 'cancelled' are NEVER reopened by a payment; 'paid' is fully
+ * settled — any further positive receipt is overpayment and is rejected.
+ * 'late' is only ever WRITTEN by an operator workflow (none exists in this
+ * milestone — nothing here marks a schedule late automatically); a receipt
+ * recorded against a late schedule reconciles it from confirmed payment facts.
+ */
+const PAYABLE_SCHEDULE_STATUSES: readonly string[] = ['scheduled', 'pending', 'late', 'partially_paid'];
+
+// -------------------------------------------------------------------------------------------
+// Exact numeric(20,4) money contract (Review Fix 1) — pure string arithmetic, no JS number
+// ever touches a payment amount. Canonical form: leading zeros stripped from the integer
+// part, fractional part padded to exactly 4 digits — byte-identical to what numeric(20,4)
+// persists and returns, so the SAME exact value flows through comparisons, persistence,
+// audit and event payloads.
+// -------------------------------------------------------------------------------------------
+
+/** Digits only, optional fractional part — signs, exponents, grouping and whitespace rejected. */
+const EXACT_DECIMAL_SHAPE = /^\d+(\.\d+)?$/;
+
+const AMOUNT_MAX_INTEGER_DIGITS = 16; // numeric(20,4) max = 9999999999999999.9999
+const AMOUNT_MAX_FRACTION_DIGITS = 4;
+
+function rejectAmount(raw: unknown, message: string): never {
+  throw new UnprocessableEntityException({ code: 'RENT_PAYMENT_AMOUNT_INVALID', message });
+}
+
+/**
+ * Validate a receipt amount against the frozen numeric(20,4) column contract
+ * and return its canonical exact form. A value that would require rounding
+ * when persisted (more than 4 fractional digits) or that exceeds the column
+ * range (more than 16 integer digits after harmless leading zeros are stripped
+ * deterministically) is rejected with an explicit client domain error BEFORE
+ * anything is inserted — never silently rounded, truncated or capped.
+ */
+export function assertPositiveDecimalString(raw: string): string {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 64 || !EXACT_DECIMAL_SHAPE.test(raw)) {
+    rejectAmount(raw, 'payment amount must be an exact positive decimal string (digits, optional fractional part; no sign, exponent, grouping or whitespace)');
+  }
+  const [intPart = '', fracPart = ''] = raw.split('.');
+  if (fracPart.length > AMOUNT_MAX_FRACTION_DIGITS) {
+    rejectAmount(raw, `payment amount '${raw}' has ${fracPart.length} fractional digits; numeric(20,4) persists exactly ${AMOUNT_MAX_FRACTION_DIGITS} — a value that would require rounding is rejected, never rounded or truncated`);
+  }
+  const intDigits = intPart.replace(/^0+/, '') || '0';
+  if (intDigits.length > AMOUNT_MAX_INTEGER_DIGITS) {
+    rejectAmount(raw, `payment amount '${raw}' exceeds the numeric(20,4) range (at most ${AMOUNT_MAX_INTEGER_DIGITS} integer digits; leading zeros are ignored)`);
+  }
+  if (intDigits === '0' && (fracPart === '' || /^0*$/.test(fracPart))) {
+    rejectAmount(raw, 'payment amount must be strictly positive (the frozen CHECK amount > 0 is the authority)');
+  }
+  return `${intDigits}.${fracPart.padEnd(AMOUNT_MAX_FRACTION_DIGITS, '0')}`;
+}
+
+/** Exact value of a canonical decimal20_4 string as a BigInt (scale fixed at 4). */
+function decimal20_4ToBigInt(canonical: string): bigint {
+  const [int, frac = ''] = canonical.split('.');
+  return BigInt(int + frac.padEnd(4, '0'));
+}
+
+/** Canonical decimal20_4 string of an exact BigInt value (scale 4). */
+function bigIntToDecimal20_4(value: bigint): string {
+  const digits = (value < 0n ? -value : value).toString().padStart(5, '0');
+  return `${digits.slice(0, -4)}.${digits.slice(-4)}`;
+}
+
+/** Canonicalize any exact numeric string coming back from PG (already scale-4 for numeric(20,4) sums). */
+export function canonicalizeDecimal20_4(raw: string): string {
+  return bigIntToDecimal20_4(decimal20_4ToBigInt(assertPositiveDecimalStringShape(raw)));
+}
+
+function assertPositiveDecimalStringShape(raw: string): string {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 64 || !EXACT_DECIMAL_SHAPE.test(raw)) {
+    rejectAmount(raw, 'stored payment value is not an exact decimal string');
+  }
+  return raw;
+}
+
+/** Exact addition of two canonical decimal20_4 strings. */
+export function addExactDecimal20_4(a: string, b: string): string {
+  return bigIntToDecimal20_4(decimal20_4ToBigInt(a) + decimal20_4ToBigInt(b));
+}
+
+/** Exact three-way comparison of two canonical decimal20_4 strings. */
+export function compareExactDecimal20_4(a: string, b: string): number {
+  const left = decimal20_4ToBigInt(a);
+  const right = decimal20_4ToBigInt(b);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
 
 type RentalPermission = 'rental.view' | 'rental.create' | 'rental.update';
 
@@ -529,6 +667,202 @@ export class RentalService {
     }, { actorUserId: actor.id });
   }
 
+  // ---------------------------------------------------------------- rent payments (Milestone 2)
+
+  /**
+   * Record an already-confirmed rent receipt and reconcile the schedule in ONE
+   * transaction. The API records a receipt the actor asserts has happened — it
+   * never initiates a payment-provider transaction, and submitting the request
+   * is not itself evidence that money moved (the actor and facts are audited).
+   *
+   * Concurrency: the schedule row is locked FOR UPDATE inside the transaction,
+   * every invariant is re-validated against the locked row, and the exact paid
+   * total is re-summed — a concurrent recorder that committed first is fully
+   * visible to the loser, whose overpayment check then rejects deterministically.
+   * A failed transaction leaves NO payment row, NO outbox event and NO audit
+   * record (single-transaction atomicity).
+   */
+  async recordRentPayment(leaseId: string, scheduleId: string, input: {
+    amount: string;
+    currencyCode: string;
+    externalPaymentId?: string | undefined;
+    paidAt?: string | undefined;
+  }, actor: AuthenticatedUser): Promise<Record<string, unknown>> {
+    // Review Fix 1 — exact numeric(20,4) contract BEFORE any DB round-trip:
+    // precision/range violations are explicit client domain errors and can
+    // never reach an INSERT (or anything else that could leave a trace).
+    const amount = assertPositiveDecimalString(input.amount);
+
+    const leaseRow = await this.getLeaseRowOrNotFound(leaseId);
+    await this.requireLeaseAccess(leaseRow, actor, 'rental.update');
+    const scheduleRow = await this.rentals.getRentSchedule(leaseRow.id, scheduleId);
+    if (!scheduleRow) {
+      throw new NotFoundException({ code: 'LEASE_SCHEDULE_NOT_FOUND', message: 'Rent schedule not found' });
+    }
+    // Currency consistency between payment and schedule (friendly pre-check;
+    // the frozen trg_rent_payment_currency trigger stays the DB authority).
+    if (input.currencyCode !== scheduleRow.currency_code) {
+      throw new UnprocessableEntityException({ code: 'RENT_PAYMENT_CURRENCY_MISMATCH', message: `payment currency must equal the schedule currency ${scheduleRow.currency_code}` });
+    }
+    // Status gate: never reopen waived/cancelled; a fully paid schedule can
+    // only overpay (the exact sum check below is the general authority).
+    if (scheduleRow.status === 'waived' || scheduleRow.status === 'cancelled') {
+      throw new UnprocessableEntityException({ code: 'RENT_PAYMENT_SCHEDULE_NOT_PAYABLE', message: `schedule is ${scheduleRow.status} and is never reopened by a payment` });
+    }
+
+    // Review Fix 2 — external billing payment provenance. The frozen billing
+    // schema establishes NO rent-specific link between billing orders and
+    // rental leases, so rent-payment intent cannot be verified from repository
+    // evidence: this path FAILS CLOSED (documented limitation — manual
+    // recording without externalPaymentId remains the supported model).
+    if (input.externalPaymentId) {
+      await this.assertExternalPaymentProvenance(leaseRow, scheduleRow, input.externalPaymentId, amount);
+    }
+
+    return this.db.transaction(async (client) => {
+      const locked = await this.rentals.getRentScheduleLocked(leaseRow.id, scheduleRow.id, client);
+      if (!locked) {
+        throw new NotFoundException({ code: 'LEASE_SCHEDULE_NOT_FOUND', message: 'Rent schedule not found' });
+      }
+      if (locked.status === 'waived' || locked.status === 'cancelled') {
+        throw new UnprocessableEntityException({ code: 'RENT_PAYMENT_SCHEDULE_NOT_PAYABLE', message: `schedule is ${locked.status} and is never reopened by a payment` });
+      }
+      if (input.currencyCode !== locked.currency_code) {
+        throw new UnprocessableEntityException({ code: 'RENT_PAYMENT_CURRENCY_MISMATCH', message: `payment currency must equal the schedule currency ${locked.currency_code}` });
+      }
+      const paidTotalBefore = canonicalizeDecimal20_4(await this.rentals.sumRentPayments(locked.id, client));
+      const paidTotalAfter = addExactDecimal20_4(paidTotalBefore, amount);
+      if (compareExactDecimal20_4(paidTotalAfter, canonicalizeDecimal20_4(locked.amount)) > 0) {
+        // Overpayment is REJECTED — never silently capped, split, refunded,
+        // absorbed or parked (exact decimal comparison, no rounding anywhere).
+        throw new UnprocessableEntityException({
+          code: 'RENT_PAYMENT_OVERPAYMENT',
+          message: `receipt of ${paidTotalAfter} would exceed the scheduled amount ${canonicalizeDecimal20_4(locked.amount)} (already paid ${paidTotalBefore}); overpayment is rejected, not capped`,
+        });
+      }
+      let paymentRow: RentPaymentRow;
+      try {
+        paymentRow = await this.rentals.insertRentPayment({
+          scheduleId: locked.id, amount, currencyCode: input.currencyCode, paidAt: input.paidAt ?? null, executor: client,
+        });
+      } catch (error) {
+        throw RentalService.mapPaymentWriteError(error);
+      }
+      const fullyPaid = compareExactDecimal20_4(paidTotalAfter, canonicalizeDecimal20_4(locked.amount)) === 0;
+      const scheduleStatusAfter = fullyPaid ? 'paid' : 'partially_paid';
+      const updatedSchedule = await this.rentals.updateRentScheduleStatus({
+        scheduleId: locked.id, toStatus: scheduleStatusAfter, paidAt: fullyPaid ? (paymentRow.paid_at ?? new Date()) : null, executor: client,
+      });
+      const paidAtIso = paymentRow.paid_at ? paymentRow.paid_at.toISOString() : null;
+      await this.outbox.append({
+        aggregateType: 'rental_rent_payment', aggregateId: paymentRow.id, eventType: 'RentPaymentRecorded.v1', eventVersion: 1,
+        payload: {
+          paymentId: paymentRow.id, leaseId: leaseRow.id, scheduleId: locked.id,
+          amount, currencyCode: input.currencyCode, paidAt: paidAtIso, externalPaymentId: null,
+          scheduleStatusBefore: locked.status, scheduleStatusAfter, paidTotal: paidTotalAfter, actorUserId: actor.id,
+        },
+      }, client);
+      await this.audit.append({
+        actorUserId: actor.id, organizationId: leaseRow.landlord_organization_id!, // guaranteed by requireLeaseAccess
+        action: 'rental.rent_payment_recorded', entityType: 'rental.rent_payment', entityId: paymentRow.id,
+        beforeData: {
+          scheduleId: locked.id, leaseId: leaseRow.id, scheduleStatus: locked.status,
+          schedulePaidAt: locked.paid_at, paidTotalBefore,
+        },
+        afterData: {
+          paymentId: paymentRow.id, scheduleId: locked.id, leaseId: leaseRow.id,
+          amount, currencyCode: input.currencyCode, paidAt: paidAtIso, externalPaymentId: null,
+          scheduleStatusBefore: locked.status, scheduleStatusAfter, paidTotalAfter,
+        },
+      }, client);
+      return {
+        payment: this.toPaymentApi(paymentRow, leaseRow.id),
+        schedule: updatedSchedule ? this.toScheduleApi(updatedSchedule) : null,
+        paidTotal: paidTotalAfter,
+        scheduleStatusBefore: locked.status,
+      };
+    }, { actorUserId: actor.id });
+  }
+
+  async listRentPayments(leaseId: string, scheduleId: string, actor: AuthenticatedUser): Promise<Array<Record<string, unknown>>> {
+    const leaseRow = await this.getLeaseRowOrNotFound(leaseId);
+    await this.requireLeaseAccess(leaseRow, actor, 'rental.view');
+    const scheduleRow = await this.rentals.getRentSchedule(leaseRow.id, scheduleId);
+    if (!scheduleRow) {
+      throw new NotFoundException({ code: 'LEASE_SCHEDULE_NOT_FOUND', message: 'Rent schedule not found' });
+    }
+    const rows = await this.rentals.listRentPayments(scheduleRow.id);
+    return rows.map((p) => this.toPaymentApi(p, leaseRow.id));
+  }
+
+  /**
+   * Review Fix 2 — external billing payment provenance chain over real frozen
+   * billing evidence (billing.payments JOIN billing.orders). Every step maps
+   * to its own explicit client domain error; ownership uses the applicable
+   * identity model (lease tenant is user XOR org by the frozen CHECK; the
+   * order must be owned by that same tenant identity). The chain ALWAYS ends
+   * in the documented fail-closed error: no schema-level rent-specific link
+   * exists, so acceptance would be exactly the invented inference the review
+   * forbids. This method never returns normally.
+   */
+  private async assertExternalPaymentProvenance(leaseRow: RentalLeaseRow, scheduleRow: RentScheduleRow, externalPaymentId: string, amount: string): Promise<never> {
+    const billing = await this.rentals.getBillingPaymentWithOrder(externalPaymentId);
+    if (!billing) {
+      throw new UnprocessableEntityException({ code: 'RENT_PAYMENT_EXTERNAL_INVALID', message: 'referenced external billing payment does not exist' });
+    }
+    if (billing.status !== 'succeeded') {
+      // An unsuccessful billing payment can never become a completed rent receipt.
+      throw new UnprocessableEntityException({ code: 'RENT_PAYMENT_EXTERNAL_NOT_CONFIRMED', message: `external billing payment status is '${billing.status}', not 'succeeded'` });
+    }
+    if (billing.currency_code !== scheduleRow.currency_code) {
+      throw new UnprocessableEntityException({ code: 'RENT_PAYMENT_CURRENCY_MISMATCH', message: `external billing payment currency ${billing.currency_code} does not match the schedule currency ${scheduleRow.currency_code}` });
+    }
+    if (compareExactDecimal20_4(canonicalizeDecimal20_4(billing.amount), amount) !== 0) {
+      throw new UnprocessableEntityException({ code: 'RENT_PAYMENT_EXTERNAL_AMOUNT_MISMATCH', message: `external billing payment amount ${canonicalizeDecimal20_4(billing.amount)} does not equal the receipt amount ${amount}` });
+    }
+    if (billing.order_status !== 'paid') {
+      throw new UnprocessableEntityException({ code: 'RENT_PAYMENT_EXTERNAL_ORDER_NOT_PAID', message: `the billing order carrying the external payment is '${billing.order_status}', not 'paid'` });
+    }
+    const tenantOwned = (leaseRow.tenant_user_id !== null && billing.order_user_id === leaseRow.tenant_user_id)
+      || (leaseRow.tenant_organization_id !== null && billing.order_organization_id === leaseRow.tenant_organization_id);
+    if (!tenantOwned) {
+      throw new UnprocessableEntityException({ code: 'RENT_PAYMENT_EXTERNAL_ORDER_NOT_TENANT_OWNED', message: 'the billing order carrying the external payment is not owned by the lease tenant' });
+    }
+    // Fail closed: ownership + status + amount/currency equality is ALL the
+    // evidence the frozen billing schema can offer — none of it establishes
+    // that the order is a RENT payment. Recording the reference would invent
+    // rent-payment intent, so the external path stays closed until a
+    // trustworthy rent-specific link exists (documented milestone limitation).
+    throw new UnprocessableEntityException({
+      code: 'RENT_PAYMENT_EXTERNAL_PROVENANCE_UNVERIFIABLE',
+      message: 'the billing schema provides no rent-specific link between billing orders and rental leases, so rent-payment intent cannot be verified; record the confirmed receipt manually (omit externalPaymentId)',
+    });
+  }
+
+  /** PG error codes mapped to domain error codes for payment writes. */
+  private static mapPaymentWriteError(error: unknown): Error {
+    const code = (error as { code?: string }).code;
+    if (code === '23505') {
+      // 0042 ux_rent_payments_external_payment — the concurrency-safe idempotency
+      // authority: the same external billing payment can never be applied twice.
+      return new ConflictException({ code: 'RENT_PAYMENT_DUPLICATE_EXTERNAL', message: 'this external billing payment has already been applied to a rent schedule' });
+    }
+    if (code === 'P0001') {
+      // trg_rent_payment_currency (frozen) — the DB currency consistency authority.
+      return new UnprocessableEntityException({ code: 'RENT_PAYMENT_CURRENCY_MISMATCH', message: 'payment currency must equal the schedule currency (frozen trigger authority)' });
+    }
+    if (code === '23503') {
+      return new ConflictException({ code: 'RENT_PAYMENT_SCHEDULE_CONFLICT', message: 'the referenced schedule no longer exists' });
+    }
+    if (code === '23514') {
+      return new UnprocessableEntityException({ code: 'RENT_PAYMENT_AMOUNT_INVALID', message: 'payment amount violates the frozen CHECK (must be a positive exact decimal)' });
+    }
+    if (error instanceof Error && error.message.includes('RENT_PAYMENT_INSERT_FAILED')) {
+      return new UnprocessableEntityException({ code: 'RENT_PAYMENT_RECORD_FAILED', message: 'rent payment could not be recorded' });
+    }
+    return error as Error;
+  }
+
   // ---------------------------------------------------------------- error mapping
 
   /** PG error codes mapped to domain error codes (valuation precedent). */
@@ -616,6 +950,15 @@ export class RentalService {
     };
   }
 
+  private toPaymentApi(p: RentPaymentRow, leaseId: string): Record<string, unknown> {
+    return {
+      id: p.id, leaseId, scheduleId: p.schedule_id, amount: p.amount,
+      currencyCode: p.currency_code, externalPaymentId: p.external_payment_id,
+      paidAt: p.paid_at, createdAt: p.created_at,
+    };
+  }
+
   // exposed for controller DTOs / OpenAPI documentation
   static readonly allowedLeaseStatuses = LEASE_STATUSES;
+  static readonly payableScheduleStatuses = PAYABLE_SCHEDULE_STATUSES;
 }

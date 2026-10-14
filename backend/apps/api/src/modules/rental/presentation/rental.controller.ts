@@ -1,5 +1,5 @@
 import { Body, Controller, Delete, Get, Param, Post, Put, Query, UseGuards } from '@nestjs/common';
-import { ArrayMaxSize, ArrayMinSize, IsBoolean, IsIn, IsInt, IsNumberString, IsObject, IsOptional, IsString, IsUUID, Length, Max, MaxLength, Min, MinLength, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, IsBoolean, IsIn, IsInt, IsISO8601, IsNumberString, IsObject, IsOptional, IsString, IsUUID, Length, Max, MaxLength, Min, MinLength, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
 import { AccessTokenGuard } from '../../../common/auth/access-token.guard';
 import { CurrentUser } from '../../../common/auth/current-user.decorator';
@@ -98,6 +98,34 @@ export class AddRentSchedulesDto {
   items!: RentScheduleItemDto[];
 }
 
+/**
+ * Milestone 2 — record an already-confirmed rent receipt.
+ *
+ * Amount policy (Review Fix 1): the DTO deliberately carries @IsString, NOT
+ * @IsNumberString — the exact numeric(20,4) contract (shape, scale ≤ 4,
+ * range ≤ 16 integer digits, positivity, deterministic leading-zero handling)
+ * is owned by ONE authoritative layer: RentalService.assertPositiveDecimalString.
+ * A value that would require rounding is rejected with an explicit client
+ * domain error before anything is written — never rounded or truncated.
+ */
+export class RecordRentPaymentDto {
+  /** Exact decimal string, strictly positive, ≤ 4 fractional digits, ≤ 16 integer digits. */
+  @IsString() @Length(1, 64) amount!: string;
+  /** Must equal the schedule currency (exact consistency, no conversion). */
+  @IsString() @Length(3, 3) currencyCode!: string;
+  /**
+   * Optional reference to a billing.payments row. Review Fix 2: the frozen
+   * billing schema establishes no rent-specific link between billing orders
+   * and rental leases, so rent-payment intent cannot be verified — the
+   * external path fails closed with RENT_PAYMENT_EXTERNAL_PROVENANCE_UNVERIFIABLE
+   * (see the service provenance chain). Omit it to record a confirmed receipt
+   * manually — the supported model.
+   */
+  @IsOptional() @IsUUID() externalPaymentId?: string;
+  /** Optional ISO-8601 timestamp of the confirmed receipt; defaults to now(). */
+  @IsOptional() @IsISO8601({ strict: true }) paidAt?: string;
+}
+
 @Controller('rental')
 @UseGuards(AccessTokenGuard)
 export class RentalController {
@@ -151,5 +179,26 @@ export class RentalController {
   @Delete('leases/:id/schedules/:scheduleId')
   async removeSchedule(@Param('id') id: string, @Param('scheduleId') scheduleId: string, @CurrentUser() user: AuthenticatedUser) {
     return { data: await this.rental.removeSchedule(id, scheduleId, user) };
+  }
+
+  /** Milestone 2 — record an already-confirmed receipt (never initiates a payment-provider transaction). */
+  @Post('leases/:id/schedules/:scheduleId/payments')
+  async recordRentPayment(
+    @Param('id') id: string,
+    @Param('scheduleId') scheduleId: string,
+    @Body() dto: RecordRentPaymentDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return { data: await this.rental.recordRentPayment(id, scheduleId, dto, user) };
+  }
+
+  /** Milestone 2 — retrieval under the lease/schedule hierarchy (org-scoped, IDOR-safe). */
+  @Get('leases/:id/schedules/:scheduleId/payments')
+  async listRentPayments(
+    @Param('id') id: string,
+    @Param('scheduleId') scheduleId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return { data: await this.rental.listRentPayments(id, scheduleId, user) };
   }
 }
