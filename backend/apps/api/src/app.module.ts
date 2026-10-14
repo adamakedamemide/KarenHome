@@ -12,6 +12,7 @@ import { MessagingModule } from './modules/messaging/messaging.module';
 import { CrmModule } from './modules/crm/crm.module';
 import { ProjectsModule } from './modules/projects/projects.module';
 import { ValuationModule } from './modules/valuation/valuation.module';
+import { RentalModule } from './modules/rental/rental.module';
 import { SearchModule } from './modules/search/search.module';
 import { IamModule } from './modules/iam/iam.module';
 import { AuthorizationModule } from './modules/authorization/authorization.module';
@@ -36,7 +37,7 @@ import { AdminModule } from './modules/admin/admin.module';
     PropertiesModule,
     ListingsModule,
     MessagingModule,
-    CrmModule, ProjectsModule, ValuationModule,
+    CrmModule, ProjectsModule, ValuationModule, RentalModule,
     SearchModule,
     CommissionModule,
     BillingModule,

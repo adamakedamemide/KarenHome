@@ -1,6 +1,6 @@
 import { Global, Module, OnApplicationShutdown } from '@nestjs/common';
 import {
-  PostgresDatabase, IamRepository, IamHardeningRepository, PropertyRepository, ListingRepository, MessagingRepository, CrmRepository, ProjectsRepository, ValuationRepository, OutboxRepository,
+  PostgresDatabase, IamRepository, IamHardeningRepository, PropertyRepository, ListingRepository, MessagingRepository, CrmRepository, ProjectsRepository, ValuationRepository, RentalRepository, OutboxRepository,
   AuditRepository, JobRepository, CommissionRepository, BillingRepository, AdvertisingRepository,
   NotificationRepository, MediaRepository, SearchIndexRepository, PublicationPolicyRepository, AntiBotRepository,
 } from '@platform/db';
@@ -27,6 +27,7 @@ import { AppConfig } from '../common/config/app-config';
     { provide: CrmRepository, inject: [PostgresDatabase], useFactory: (db: PostgresDatabase) => new CrmRepository(db) },
     { provide: ProjectsRepository, inject: [PostgresDatabase], useFactory: (db: PostgresDatabase) => new ProjectsRepository(db) },
     { provide: ValuationRepository, inject: [PostgresDatabase], useFactory: (db: PostgresDatabase) => new ValuationRepository(db) },
+    { provide: RentalRepository, inject: [PostgresDatabase], useFactory: (db: PostgresDatabase) => new RentalRepository(db) },
     { provide: OutboxRepository, inject: [PostgresDatabase], useFactory: (db: PostgresDatabase) => new OutboxRepository(db) },
     { provide: AuditRepository, inject: [PostgresDatabase], useFactory: (db: PostgresDatabase) => new AuditRepository(db) },
     { provide: JobRepository, inject: [PostgresDatabase], useFactory: (db: PostgresDatabase) => new JobRepository(db) },
@@ -40,7 +41,7 @@ import { AppConfig } from '../common/config/app-config';
     { provide: AntiBotRepository, inject: [PostgresDatabase], useFactory: (db: PostgresDatabase) => new AntiBotRepository(db) },
   ],
   exports: [
-    AppConfig, PostgresDatabase, IamRepository, IamHardeningRepository, PropertyRepository, ListingRepository, MessagingRepository, CrmRepository, ProjectsRepository, ValuationRepository, OutboxRepository,
+    AppConfig, PostgresDatabase, IamRepository, IamHardeningRepository, PropertyRepository, ListingRepository, MessagingRepository, CrmRepository, ProjectsRepository, ValuationRepository, RentalRepository, OutboxRepository,
     AuditRepository, JobRepository, CommissionRepository, BillingRepository, AdvertisingRepository,
     NotificationRepository, MediaRepository, SearchIndexRepository, PublicationPolicyRepository, AntiBotRepository,
   ],

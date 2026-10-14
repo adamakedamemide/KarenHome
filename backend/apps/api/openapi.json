@@ -2490,6 +2490,268 @@
         ]
       }
     },
+    "/api/v1/rental/leases": {
+      "post": {
+        "operationId": "RentalController_createLease",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateLeaseDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      },
+      "get": {
+        "operationId": "RentalController_listLeases",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      }
+    },
+    "/api/v1/rental/leases/{id}": {
+      "get": {
+        "operationId": "RentalController_getLease",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      },
+      "put": {
+        "operationId": "RentalController_updateLease",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateLeaseDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      }
+    },
+    "/api/v1/rental/leases/{id}/status": {
+      "post": {
+        "operationId": "RentalController_changeStatus",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeaseStatusDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      }
+    },
+    "/api/v1/rental/leases/{id}/parties": {
+      "get": {
+        "operationId": "RentalController_listParties",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      },
+      "post": {
+        "operationId": "RentalController_addParties",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddLeasePartiesDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      }
+    },
+    "/api/v1/rental/leases/{id}/schedules": {
+      "get": {
+        "operationId": "RentalController_listSchedules",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      },
+      "post": {
+        "operationId": "RentalController_addSchedules",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddRentSchedulesDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      }
+    },
+    "/api/v1/rental/leases/{id}/schedules/{scheduleId}": {
+      "delete": {
+        "operationId": "RentalController_removeSchedule",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scheduleId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "Rental"
+        ]
+      }
+    },
     "/api/v1/commission/calculations": {
       "post": {
         "operationId": "CommissionController_calculate",
@@ -3649,6 +3911,10 @@
       "description": "Valuation cases, lifecycle, exact-decimal results and comparable evidence (no invented parameters; IRR=TBD)"
     },
     {
+      "name": "rental",
+      "description": "Rental leases, parties, schedules and lifecycle (frozen 0018 schema is the authority; no invented financial or legal rules)"
+    },
+    {
       "name": "admin",
       "description": ""
     },
@@ -3824,6 +4090,26 @@
         "properties": {}
       },
       "AddComparablesDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "CreateLeaseDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "UpdateLeaseDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "LeaseStatusDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "AddLeasePartiesDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "AddRentSchedulesDto": {
         "type": "object",
         "properties": {}
       },
