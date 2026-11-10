@@ -81,6 +81,55 @@ import type { AuthenticatedUser } from '@platform/contracts';
  *                         remains the supported model. Documented limitation;
  *                         no payment-provider transaction is ever initiated.
  *
+ * Milestone 3 (post-commencement schedule management) adds, on the SAME
+ * layering discipline:
+ *   DB (frozen 0018)    → rent_schedules CHECK (amount >= 0) — zero is a valid
+ *                         schedule amount, unlike the payments CHECK (> 0) —,
+ *                         the UNIQUE (lease_id, due_date) duplicate authority,
+ *                         the rent_payment_status enum + DEFAULT 'scheduled'
+ *                         vocabulary (no transition is invented) and the
+ *                         RESTRICT FK guarding schedule deletes.
+ *   Service rule        → the schedule-specific exact numeric(20,4) contract
+ *                         (assertNonNegativeDecimalString: digits with an
+ *                         optional fractional part only, ≤ 4 fractional digits,
+ *                         ≤ 16 integer digits after deterministic leading-zero
+ *                         handling, zero valid; a value that would need
+ *                         rounding is REJECTED before database access — never
+ *                         rounded or truncated — with LEASE_SCHEDULE_AMOUNT_
+ *                         INVALID; deliberately NOT the rent-receipt
+ *                         assertPositiveDecimalString, whose CHECK contract is
+ *                         amount > 0), the controlled append vocabulary
+ *                         (draft | pending_signature | active accept NEW
+ *                         schedule rows; expired | terminated | cancelled
+ *                         reject additions), the pristine-amendment gate (the
+ *                         parent lease must be draft | pending_signature |
+ *                         active; the schedule must be exactly 'scheduled'
+ *                         with paid_at NULL and ZERO recorded receipts —
+ *                         pending, late, partially_paid, paid, waived and
+ *                         cancelled schedules are never reopened or modified)
+ *                         and friendly pre-checks (404/403/422) before the DB
+ *                         round-trip, mirrored under the row locks.
+ *   Concurrency         → the lease row is re-read and locked FOR UPDATE inside
+ *                         the write transaction (the active-state decision is
+ *                         never made on an unlocked pre-read); the target
+ *                         schedule row is locked FOR UPDATE before amendment;
+ *                         the receipt-payment check runs under the same lock;
+ *                         lock ordering = lease row first, schedule row second
+ *                         (the M2 payment path takes only the schedule row, so
+ *                         amendments and receipts serialize on the schedule row
+ *                         and no cycle can form); PostgreSQL unique violations
+ *                         and constraint errors map to explicit domain
+ *                         responses; a failed transaction leaves NO schedule
+ *                         mutation and NO audit record.
+ *   Audit               → before/after rows for amendments and the existing
+ *                         rental.schedules_added convention for appends (actor,
+ *                         landlord organization, lease/schedule IDs, due date,
+ *                         exact canonical amount and currency), written
+ *                         transactionally with the mutation; schedule
+ *                         sub-resource changes stay AUDIT-ONLY (M1 precedent —
+ *                         no new outbox event is invented and the existing
+ *                         event contracts are untouched).
+ *
  * Scope lock: no FX conversion, no rent escalation, no late fees, no tax rates,
  * no deposit percentages, no renewal notice periods, no jurisdiction-specific
  * legal conditions, no electronic-signature claims, no ledger posting and no
@@ -107,6 +156,15 @@ const LEASE_TRANSITIONS: Record<string, readonly string[]> = {
 
 /** Pre-commencement states in which lease meta/parties/schedules stay mutable. */
 const MUTABLE_LEASE_STATUSES: readonly string[] = ['draft', 'pending_signature'];
+
+/**
+ * Milestone 3 — lease statuses that accept controlled rent-schedule management:
+ * NEW schedule rows may be appended and PRISTINE schedule rows may be amended
+ * while draft | pending_signature (the M1 mutability window) OR active (the
+ * controlled post-commencement append/amendment this milestone adds).
+ * expired | terminated | cancelled reject both additions and amendments.
+ */
+const SCHEDULE_MANAGEABLE_LEASE_STATUSES: readonly string[] = ['draft', 'pending_signature', 'active'];
 
 /**
  * Schedule statuses a rent receipt can be recorded against (Milestone 2).
@@ -159,6 +217,42 @@ export function assertPositiveDecimalString(raw: string): string {
   if (intDigits === '0' && (fracPart === '' || /^0*$/.test(fracPart))) {
     rejectAmount(raw, 'payment amount must be strictly positive (the frozen CHECK amount > 0 is the authority)');
   }
+  return `${intDigits}.${fracPart.padEnd(AMOUNT_MAX_FRACTION_DIGITS, '0')}`;
+}
+
+function rejectScheduleAmount(raw: unknown, message: string): never {
+  throw new UnprocessableEntityException({ code: 'LEASE_SCHEDULE_AMOUNT_INVALID', message });
+}
+
+/**
+ * Milestone 3 — validate a rent-SCHEDULE amount against the frozen numeric(20,4)
+ * column contract and return its canonical exact form. The schedule CHECK is
+ * `amount >= 0` (deliberately different from the rent-receipt CHECK `> 0`), so
+ * ZERO is a valid schedule amount and this validator deliberately does NOT
+ * reuse assertPositiveDecimalString. Same exactness discipline: digits with an
+ * optional fractional part only (no signs, exponents, grouping separators or
+ * whitespace), at most 4 fractional digits (a value that would require rounding
+ * is rejected, never rounded or truncated), at most 16 integer digits after
+ * harmless leading zeros are stripped deterministically. Pure string/BigInt
+ * arithmetic — a JS number never touches a schedule amount. Violations are
+ * explicit client domain errors (LEASE_SCHEDULE_AMOUNT_INVALID) raised BEFORE
+ * any database access, so PostgreSQL can never silently round an
+ * over-precision amount. Applied to BOTH the M1 schedule creation path and the
+ * M3 amendment path.
+ */
+export function assertNonNegativeDecimalString(raw: string): string {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 64 || !EXACT_DECIMAL_SHAPE.test(raw)) {
+    rejectScheduleAmount(raw, 'schedule amount must be an exact non-negative decimal string (digits with an optional fractional part; no sign, exponent, grouping separators or whitespace)');
+  }
+  const [intPart = '', fracPart = ''] = raw.split('.');
+  if (fracPart.length > AMOUNT_MAX_FRACTION_DIGITS) {
+    rejectScheduleAmount(raw, `schedule amount '${raw}' has ${fracPart.length} fractional digits; numeric(20,4) persists exactly ${AMOUNT_MAX_FRACTION_DIGITS} — a value that would require rounding is rejected, never rounded or truncated`);
+  }
+  const intDigits = intPart.replace(/^0+/, '') || '0';
+  if (intDigits.length > AMOUNT_MAX_INTEGER_DIGITS) {
+    rejectScheduleAmount(raw, `schedule amount '${raw}' exceeds the numeric(20,4) range (at most ${AMOUNT_MAX_INTEGER_DIGITS} integer digits; leading zeros are ignored)`);
+  }
+  // Zero is valid: the frozen schedule CHECK is amount >= 0 (unlike receipts).
   return `${intDigits}.${fracPart.padEnd(AMOUNT_MAX_FRACTION_DIGITS, '0')}`;
 }
 
@@ -249,6 +343,50 @@ export class RentalService {
       throw new UnprocessableEntityException({
         code: 'LEASE_NOT_MUTABLE',
         message: `lease is ${leaseRow.status}; meta, parties and schedules are only mutable before commencement (draft | pending_signature)`,
+      });
+    }
+  }
+
+  /**
+   * Milestone 3 — append gate for rent schedules: draft | pending_signature
+   * (unchanged M1 behavior) and active (the controlled post-commencement
+   * append) accept NEW schedule rows; expired | terminated | cancelled reject
+   * additions with the established LEASE_NOT_MUTABLE domain error.
+   */
+  private static assertScheduleAppendable(leaseStatus: string): void {
+    if (!SCHEDULE_MANAGEABLE_LEASE_STATUSES.includes(leaseStatus)) {
+      throw new UnprocessableEntityException({
+        code: 'LEASE_NOT_MUTABLE',
+        message: `lease is ${leaseStatus}; rent schedules can only be added while draft | pending_signature | active — expired, terminated and cancelled leases reject additions`,
+      });
+    }
+  }
+
+  /**
+   * Milestone 3 — pristine-amendment gate: the parent lease must be
+   * draft | pending_signature | active, the schedule status must be exactly
+   * 'scheduled' (pending, late, partially_paid, paid, waived and cancelled
+   * schedules are NEVER reopened or modified — no status transition is
+   * inferred) and paid_at must be NULL. Receipt-bearing rows are rejected by
+   * the rent_payments count check under the row lock (see amendSchedule).
+   */
+  private static assertScheduleAmendable(leaseStatus: string, scheduleStatus: string, paidAt: Date | null): void {
+    if (!SCHEDULE_MANAGEABLE_LEASE_STATUSES.includes(leaseStatus)) {
+      throw new UnprocessableEntityException({
+        code: 'LEASE_SCHEDULE_NOT_AMENDABLE',
+        message: `lease is ${leaseStatus}; rent schedules are amendable only while draft | pending_signature | active`,
+      });
+    }
+    if (scheduleStatus !== 'scheduled') {
+      throw new UnprocessableEntityException({
+        code: 'LEASE_SCHEDULE_NOT_AMENDABLE',
+        message: `schedule is ${scheduleStatus}; only pristine 'scheduled' rows can be amended — pending, late, partially_paid, paid, waived and cancelled schedules are never reopened or modified`,
+      });
+    }
+    if (paidAt !== null) {
+      throw new UnprocessableEntityException({
+        code: 'LEASE_SCHEDULE_NOT_AMENDABLE',
+        message: 'schedule carries a paid_at timestamp; only pristine scheduled rows without recorded receipts can be amended',
       });
     }
   }
@@ -594,26 +732,74 @@ export class RentalService {
 
   // ---------------------------------------------------------------- rent schedules
 
+  /**
+   * Add rent-schedule rows to a lease (M1 creation path, extended by M3 for
+   * post-commencement appends).
+   *
+   * Milestone 3 state rules: draft | pending_signature keep the unchanged M1
+   * behavior; `active` leases accept controlled additions (post-commencement
+   * rent scheduling); expired | terminated | cancelled reject additions with
+   * the established LEASE_NOT_MUTABLE domain error. Access is checked BEFORE
+   * any state-derived error (no existence leak).
+   *
+   * Exactness: every amount passes assertNonNegativeDecimalString (the
+   * schedule-specific exact numeric(20,4) contract — zero valid, rounding
+   * rejected) BEFORE any database access, so PostgreSQL can never silently
+   * round an over-precision value; the SAME canonical exact value flows into
+   * the INSERT and the audit payload.
+   *
+   * Concurrency: the lease row is re-read and locked FOR UPDATE inside the
+   * write transaction — the appendable-state decision is NEVER made on the
+   * unlocked pre-read, so a concurrent lifecycle move that commits first (e.g.
+   * termination) is visible under the lock and a new schedule can never be
+   * committed against a lease that is no longer active. Currency is validated
+   * against the LOCKED lease row (the lease currency is the only authority; no
+   * conversion). The frozen UNIQUE (lease_id, due_date) stays the duplicate
+   * authority (23505 → 409 LEASE_SCHEDULE_DUPLICATE) and new rows keep the
+   * frozen database default status (DEFAULT 'scheduled') — no status is
+   * invented. A failed transaction leaves NO schedule row and NO audit record.
+   */
   async addSchedules(leaseId: string, items: Array<{
     dueDate: string;
     amount: string;
     currencyCode: string;
   }>, actor: AuthenticatedUser): Promise<Array<Record<string, unknown>>> {
+    // Milestone 3 — exact non-negative numeric(20,4) contract BEFORE any DB
+    // round-trip: precision/range violations are explicit client domain errors
+    // and can never reach an INSERT (zero is valid — the frozen schedule CHECK
+    // is amount >= 0).
+    const canonicalItems = items.map((item) => ({
+      dueDate: item.dueDate,
+      amount: assertNonNegativeDecimalString(item.amount),
+      currencyCode: item.currencyCode,
+    }));
     const leaseRow = await this.getLeaseRowOrNotFound(leaseId);
     await this.requireLeaseAccess(leaseRow, actor, 'rental.update');
-    RentalService.assertMutable(leaseRow);
+    RentalService.assertScheduleAppendable(leaseRow.status);
     // Currency consistency: every schedule carries the lease's own canonical
     // currency — no conversion, no FX logic; a mismatching request is rejected.
-    for (const item of items) {
+    // (Friendly pre-check; re-validated against the locked lease row below.)
+    for (const item of canonicalItems) {
       if (item.currencyCode !== leaseRow.currency_code) {
         throw new UnprocessableEntityException({ code: 'LEASE_SCHEDULE_CURRENCY_MISMATCH', message: `schedule currency must equal the lease currency ${leaseRow.currency_code}` });
       }
     }
     return this.db.transaction(async (client) => {
-      for (const item of items) {
+      // Milestone 3 — re-read and LOCK the lease row: the appendable-state
+      // decision is never made on an unlocked pre-read (concurrent lifecycle
+      // moves serialize here before any schedule row is written).
+      const lockedLease = await this.rentals.getLeaseLocked(leaseRow.id, client);
+      if (!lockedLease) {
+        throw new NotFoundException({ code: 'LEASE_NOT_FOUND', message: 'Lease not found' });
+      }
+      RentalService.assertScheduleAppendable(lockedLease.status);
+      for (const item of canonicalItems) {
+        if (item.currencyCode !== lockedLease.currency_code) {
+          throw new UnprocessableEntityException({ code: 'LEASE_SCHEDULE_CURRENCY_MISMATCH', message: `schedule currency must equal the lease currency ${lockedLease.currency_code}` });
+        }
         try {
           await this.rentals.addRentSchedule({
-            leaseId: leaseRow.id, dueDate: item.dueDate, amount: item.amount, currencyCode: item.currencyCode, executor: client,
+            leaseId: lockedLease.id, dueDate: item.dueDate, amount: item.amount, currencyCode: item.currencyCode, executor: client,
           });
         } catch (error) {
           throw RentalService.mapScheduleWriteError(error);
@@ -621,14 +807,115 @@ export class RentalService {
       }
       await this.audit.append({
         actorUserId: actor.id, organizationId: leaseRow.landlord_organization_id!, // guaranteed by requireLeaseAccess
-        action: 'rental.schedules_added', entityType: 'rental.lease', entityId: leaseRow.id,
+        action: 'rental.schedules_added', entityType: 'rental.lease', entityId: lockedLease.id,
         afterData: {
-          count: items.length,
-          items: items.map((i) => ({ dueDate: i.dueDate, amount: i.amount, currencyCode: i.currencyCode })),
+          leaseId: lockedLease.id, leaseStatusAtAdd: lockedLease.status, currencyCode: lockedLease.currency_code,
+          count: canonicalItems.length,
+          items: canonicalItems.map((i) => ({ dueDate: i.dueDate, amount: i.amount, currencyCode: i.currencyCode })),
         },
       }, client);
-      const rows = await this.rentals.listRentSchedules(leaseRow.id, client);
+      const rows = await this.rentals.listRentSchedules(lockedLease.id, client);
       return rows.map((s) => this.toScheduleApi(s));
+    }, { actorUserId: actor.id });
+  }
+
+  /**
+   * Milestone 3 — controlled amendment of a pristine schedule row (PUT
+   * replacement of the editable fields dueDate + amount). The currency is
+   * immutable (the request carries no currency field and the column is never
+   * written — it stays the lease currency by the frozen schema's own
+   * consistency discipline), the receipt-free and unpaid state is mandatory
+   * (a pristine amendment must NEVER alter a receipt, a reconciled schedule or
+   * audit history), and closed lifecycle states never amend.
+   *
+   * Pristine gate (friendly pre-check first, re-validated under the locks):
+   *   - the parent lease is draft | pending_signature | active;
+   *   - the schedule status is exactly 'scheduled' (pending, late,
+   *     partially_paid, paid, waived and cancelled schedules are NEVER reopened
+   *     or modified — no transition is inferred);
+   *   - paid_at is NULL;
+   *   - ZERO rows in rental.rent_payments.
+   *
+   * Concurrency: lock ordering = lease row FOR UPDATE first, then the schedule
+   * row FOR UPDATE (the M2 payment path takes only the schedule row — so a
+   * receipt recorder and a schedule amendment serialize on the schedule row and
+   * never both commit based on stale assumptions; a payment that committed
+   * first makes the pristine check fail here, and an amendment that committed
+   * first is fully visible to the payment's re-validated reconciliation). The
+   * receipt count is evaluated under the same transaction and lock. The frozen
+   * UNIQUE (lease_id, due_date) is the concurrent due-date authority (23505 →
+   * 409 LEASE_SCHEDULE_DUPLICATE — exactly one concurrent winner). A failed
+   * transaction leaves NO schedule mutation and NO audit record.
+   */
+  async amendSchedule(leaseId: string, scheduleId: string, input: {
+    dueDate: string;
+    amount: string;
+  }, actor: AuthenticatedUser): Promise<Record<string, unknown>> {
+    // Milestone 3 — exact non-negative numeric(20,4) contract BEFORE any DB
+    // round-trip (same validator as the append path).
+    const amount = assertNonNegativeDecimalString(input.amount);
+
+    const leaseRow = await this.getLeaseRowOrNotFound(leaseId);
+    await this.requireLeaseAccess(leaseRow, actor, 'rental.update');
+    const scheduleRow = await this.rentals.getRentSchedule(leaseRow.id, scheduleId);
+    if (!scheduleRow) {
+      throw new NotFoundException({ code: 'LEASE_SCHEDULE_NOT_FOUND', message: 'Rent schedule not found' });
+    }
+    RentalService.assertScheduleAmendable(leaseRow.status, scheduleRow.status, scheduleRow.paid_at);
+
+    return this.db.transaction(async (client) => {
+      // Lock the parent lease row FIRST (consistent ordering — see the
+      // repository notes), then the schedule row FOR UPDATE (the same
+      // schedule-row discipline the M2 payment path uses).
+      const lockedLease = await this.rentals.getLeaseLocked(leaseRow.id, client);
+      if (!lockedLease) {
+        throw new NotFoundException({ code: 'LEASE_NOT_FOUND', message: 'Lease not found' });
+      }
+      RentalService.assertScheduleAmendable(lockedLease.status, scheduleRow.status, scheduleRow.paid_at);
+      const locked = await this.rentals.getRentScheduleLocked(leaseRow.id, scheduleId, client);
+      if (!locked) {
+        throw new NotFoundException({ code: 'LEASE_SCHEDULE_NOT_FOUND', message: 'Rent schedule not found' });
+      }
+      // Full pristine re-validation under the locks — the authorized pre-read
+      // can never be a substitute for the locked row.
+      RentalService.assertScheduleAmendable(lockedLease.status, locked.status, locked.paid_at);
+      const paymentCount = await this.rentals.countRentPayments(locked.id, client);
+      if (paymentCount > 0) {
+        throw new UnprocessableEntityException({
+          code: 'LEASE_SCHEDULE_NOT_AMENDABLE',
+          message: `schedule carries ${paymentCount} recorded rent payment(s); an amendment must never alter a receipt, a payment amount or a reconciled schedule`,
+        });
+      }
+
+      let updated: RentScheduleRow | null;
+      try {
+        updated = await this.rentals.amendRentSchedule({
+          leaseId: lockedLease.id, scheduleId: locked.id, dueDate: input.dueDate, amount, executor: client,
+        });
+      } catch (error) {
+        throw RentalService.mapScheduleWriteError(error);
+      }
+      if (!updated) {
+        // Defensive (the FOR UPDATE lock held through the write makes this
+        // unreachable for any concurrent writer): never a silent no-op.
+        throw new ConflictException({
+          code: 'LEASE_SCHEDULE_CONCURRENT_MODIFICATION',
+          message: 'schedule moved concurrently while the amendment held the row lock; re-read the schedule and retry',
+        });
+      }
+      await this.audit.append({
+        actorUserId: actor.id, organizationId: leaseRow.landlord_organization_id!, // guaranteed by requireLeaseAccess
+        action: 'rental.schedule_amended', entityType: 'rental.lease_schedule', entityId: updated.id,
+        beforeData: {
+          leaseId: lockedLease.id, scheduleId: locked.id, dueDate: locked.due_date, amount: locked.amount,
+          currencyCode: locked.currency_code, status: locked.status, paidAt: locked.paid_at,
+        },
+        afterData: {
+          leaseId: lockedLease.id, scheduleId: updated.id, dueDate: updated.due_date, amount: updated.amount,
+          currencyCode: updated.currency_code, status: updated.status, paidAt: updated.paid_at,
+        },
+      }, client);
+      return this.toScheduleApi(updated);
     }, { actorUserId: actor.id });
   }
 

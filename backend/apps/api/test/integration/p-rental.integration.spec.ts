@@ -494,13 +494,16 @@ d('Gate P Rental M1 — integration against real PostgreSQL', () => {
     await expect(service.addParties(id, [{ role: 'bad', userId: f.actor.id, organizationId: f.orgId, nameSnapshot: 'X' }], f.actor))
       .rejects.toMatchObject({ response: { code: 'LEASE_PARTY_IDENTITY_INVALID' } });
 
-    // after commencement everything structural is frozen (422 NOT_MUTABLE)
+    // after commencement the meta/parties structure is frozen (422 NOT_MUTABLE);
+    // Milestone 3 supersedes the schedule-append expectation for the ACTIVE state
     await service.changeLeaseStatus(id, 'pending_signature', f.actor);
     await service.changeLeaseStatus(id, 'active', f.actor);
     await expect(service.updateLease(id, { monthlyRent: '2000' }, f.actor)).rejects.toMatchObject({ response: { code: 'LEASE_NOT_MUTABLE' } });
-    await expect(service.addSchedules(id, [{ dueDate: '2031-05-01', amount: '1', currencyCode: 'USD' }], f.actor)).rejects.toMatchObject({ response: { code: 'LEASE_NOT_MUTABLE' } });
     await expect(service.addParties(id, [{ role: 'agent', userId: f.actor.id, nameSnapshot: 'Y' }], f.actor)).rejects.toMatchObject({ response: { code: 'LEASE_NOT_MUTABLE' } });
     await expect(service.removeSchedule(id, '00000000-0000-4000-8000-0000000000aa', f.actor)).rejects.toMatchObject({ response: { code: 'LEASE_NOT_MUTABLE' } });
+    // Milestone 3: ACTIVE leases accept controlled schedule additions (was LEASE_NOT_MUTABLE before this milestone)
+    const activeAppend = (await service.addSchedules(id, [{ dueDate: '2031-05-01', amount: '1', currencyCode: 'USD' }], f.actor)) as Array<Record<string, unknown>>;
+    expect(activeAppend.some((s) => s['dueDate'] === '2031-05-01')).toBe(true);
 
     // stale mutability pre-read (status moved concurrently) → guarded UPDATE 0 rows → 409
     const originalGetLease = repo.getLease.bind(repo);

@@ -45,6 +45,12 @@ function makeRepo(overrides: Record<string, LooseMock> = {}) {
     listRentSchedules: mockFn(async () => [{ ...scheduleRow }]),
     getRentSchedule: mockFn(async () => ({ ...scheduleRow })),
     deleteRentSchedule: mockFn(async () => ({ ...scheduleRow })),
+    // Milestone 3 — schedule-append/amendment internals (addSchedules now locks
+    // the lease row inside the transaction; the amendment path adds the rest).
+    getLeaseLocked: mockFn(async () => ({ ...leaseRow })),
+    getRentScheduleLocked: mockFn(async () => ({ ...scheduleRow })),
+    countRentPayments: mockFn(async () => 0),
+    amendRentSchedule: mockFn(async () => ({ ...scheduleRow })),
   };
   return Object.assign(repo, overrides);
 }
@@ -207,8 +213,8 @@ describe('RentalService — lifecycle transitions (application matrix; DB stays 
 });
 
 describe('RentalService — mutability window and updates', () => {
-  it('R12 — meta/parties/schedules are 422 LEASE_NOT_MUTABLE once active/expired/terminated/cancelled', async () => {
-    for (const status of ['active', 'expired', 'terminated', 'cancelled']) {
+  it('R12 — meta/parties/schedule-DELETION are 422 LEASE_NOT_MUTABLE once expired/terminated/cancelled (Milestone 3: active leases are additionally appendable/amendable for schedules, everything else stays frozen)', async () => {
+    for (const status of ['expired', 'terminated', 'cancelled']) {
       const s = makeService(makeRepo({ getLease: mockFn(async () => ({ ...leaseRow, status })) }));
       await expect(s.service.updateLease('lease-1', { monthlyRent: '1700' }, actor))
         .rejects.toMatchObject({ response: { code: 'LEASE_NOT_MUTABLE' } });
@@ -219,6 +225,17 @@ describe('RentalService — mutability window and updates', () => {
       await expect(s.service.removeSchedule('lease-1', 'sched-1', actor))
         .rejects.toMatchObject({ response: { code: 'LEASE_NOT_MUTABLE' } });
     }
+    // Milestone 3 supersedes the M2-era expectation for the ACTIVE state on the
+    // append path ONLY: meta/parties/deletion stay rejected for active leases.
+    const active = makeService(makeRepo({ getLease: mockFn(async () => ({ ...leaseRow, status: 'active' })) }));
+    await expect(active.service.updateLease('lease-1', { monthlyRent: '1700' }, actor))
+      .rejects.toMatchObject({ response: { code: 'LEASE_NOT_MUTABLE' } });
+    await expect(active.service.addParties('lease-1', [{ role: 'agent', userId: 'user-2', nameSnapshot: 'A' }], actor))
+      .rejects.toMatchObject({ response: { code: 'LEASE_NOT_MUTABLE' } });
+    await expect(active.service.removeSchedule('lease-1', 'sched-1', actor))
+      .rejects.toMatchObject({ response: { code: 'LEASE_NOT_MUTABLE' } });
+    await expect(active.service.addSchedules('lease-1', [{ dueDate: '2030-02-01', amount: '10', currencyCode: 'USD' }], actor))
+      .resolves.toBeTruthy(); // controlled post-commencement append (Milestone 3)
   });
 
   it('R13 — empty update = 422 LEASE_NO_CHANGES; effective date pair pre-checked (422)', async () => {
@@ -256,9 +273,19 @@ describe('RentalService — schedules (exact decimal, currency consistency)', ()
     const s = makeService(makeRepo({ addRentSchedule: mockFn(async () => { throw dup; }) }));
     await expect(s.service.addSchedules('lease-1', [{ dueDate: '2030-02-01', amount: '1', currencyCode: 'USD' }], actor))
       .rejects.toMatchObject({ status: 409, response: { code: 'LEASE_SCHEDULE_DUPLICATE' } });
-    const range = new Error('check'); (range as any).code = '23514';
-    const s2 = makeService(makeRepo({ addRentSchedule: mockFn(async () => { throw range; }) }));
+    // Milestone 3 — a negative amount now violates the exact non-negative
+    // numeric(20,4) contract BEFORE any database access (no sign allowed), so
+    // the schedule-specific domain error replaces the raw 23514 mapping here.
+    const s2 = makeService();
     await expect(s2.service.addSchedules('lease-1', [{ dueDate: '2030-02-01', amount: '-1', currencyCode: 'USD' }], actor))
+      .rejects.toMatchObject({ response: { code: 'LEASE_SCHEDULE_AMOUNT_INVALID' } });
+    expect(s2.repo.addRentSchedule).not.toHaveBeenCalled();
+    expect(s2.db.transaction).not.toHaveBeenCalled();
+    // the frozen CHECK stays the DB authority for anything that slips past
+    // application validation (any other writer)
+    const range = new Error('check'); (range as any).code = '23514';
+    const s2b = makeService(makeRepo({ addRentSchedule: mockFn(async () => { throw range; }) }));
+    await expect(s2b.service.addSchedules('lease-1', [{ dueDate: '2030-02-01', amount: '1', currencyCode: 'USD' }], actor))
       .rejects.toMatchObject({ response: { code: 'LEASE_SCHEDULE_RANGE_INVALID' } });
     const restrict = new Error('foreign key'); (restrict as any).code = '23503';
     const s3 = makeService(makeRepo({ deleteRentSchedule: mockFn(async () => { throw restrict; }) }));

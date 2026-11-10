@@ -227,6 +227,24 @@ export class RentalRepository {
   }
 
   /**
+   * Milestone 3 — lock the lease row FOR UPDATE inside a write transaction.
+   * Post-commencement schedule management (append and amendment) re-reads the
+   * lifecycle state under this lock, so the active-state decision NEVER relies
+   * on an unlocked pre-read: a lifecycle move that committed first (e.g. a
+   * concurrent termination) is visible to this re-read and a new schedule can
+   * never be committed against a lease that is no longer active. Lock ordering
+   * discipline: the lease row is taken FIRST, then the schedule row — the
+   * payment path takes only the schedule row, so no cycle can form.
+   */
+  async getLeaseLocked(id: string, executor: QueryExecutor = this.db): Promise<RentalLeaseRow | null> {
+    const r = await executor.query<RentalLeaseRow>(
+      `SELECT ${LEASE_COLS} FROM rental.leases WHERE id = $1::uuid FOR UPDATE`,
+      [id],
+    );
+    return r.rows[0] ?? null;
+  }
+
+  /**
    * Organization-scoped listing. Exactly one access root must be provided:
    *   - organizationId        → leases where that org is the LANDLORD org
    *                             (member pre-checked upstream)
@@ -456,6 +474,50 @@ export class RentalRepository {
       [leaseId, scheduleId],
     );
     return r.rows[0] ?? null;
+  }
+
+  /**
+   * Milestone 3 — controlled amendment of a PRISTINE schedule row: replaces the
+   * editable fields due_date and amount. The currency is immutable (it is not
+   * part of the statement), the existing database default status vocabulary is
+   * untouched (no status is written), and the frozen UNIQUE (lease_id, due_date)
+   * stays the duplicate-date authority — a concurrent/other-row collision
+   * surfaces as PG 23505 and is mapped upstream to a 409. The caller performs
+   * every state re-validation under the schedule row lock BEFORE calling this;
+   * the statement itself is scoped to the exact lease/schedule pair.
+   */
+  async amendRentSchedule(input: {
+    leaseId: string;
+    scheduleId: string;
+    dueDate: string;
+    amount: string;
+    executor?: QueryExecutor | undefined;
+  }): Promise<RentScheduleRow | null> {
+    const ex = input.executor ?? this.db;
+    const r = await ex.query<RentScheduleRow>(
+      `UPDATE rental.rent_schedules
+          SET due_date = $3::date, amount = $4::numeric
+        WHERE id = $2::uuid AND lease_id = $1::uuid
+        RETURNING ${SCHEDULE_COLS}`,
+      [input.leaseId, input.scheduleId, input.dueDate, input.amount],
+    );
+    return r.rows[0] ?? null;
+  }
+
+  /**
+   * Milestone 3 — number of recorded receipts against a schedule. Evaluated
+   * INSIDE the amendment transaction while the schedule row is locked FOR
+   * UPDATE: the frozen FK forces every payment INSERT (including the M2
+   * recorder path) to take FOR KEY SHARE on this row, which conflicts with the
+   * amendment's FOR UPDATE — so a receipt and an amendment serialize here and
+   * the pristine check can never pass on stale assumptions.
+   */
+  async countRentPayments(scheduleId: string, executor: QueryExecutor = this.db): Promise<number> {
+    const r = await executor.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM rental.rent_payments WHERE schedule_id = $1::uuid`,
+      [scheduleId],
+    );
+    return Number(r.rows[0]?.count ?? '0');
   }
 
   // ---------------------------------------------------------------- rent payments (Milestone 2)

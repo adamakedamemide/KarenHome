@@ -479,14 +479,16 @@ d('Gate P Rental M2 — integration against real PostgreSQL', () => {
     expect(leaseId).toBeTruthy();
   });
 
-  it('PM10 — active-lease schedule payment: the only post-commencement schedule management this milestone adds', async () => {
+  it('PM10 — active-lease receipts recorded against existing schedules (Milestone 3 supersedes the append rejection: controlled schedule APPEND is now allowed on active leases, deletion stays rejected)', async () => {
     const f = await fixture();
     const { leaseId, scheduleId } = await createLeaseWithSchedule(f, { dueDate: '2031-02-01', amount: '1200.0000' });
     await service.changeLeaseStatus(leaseId, 'pending_signature', f.actor);
     await service.changeLeaseStatus(leaseId, 'active', f.actor);
-    // structural schedule management stays frozen after commencement…
-    await expect(service.addSchedules(leaseId, [{ dueDate: '2031-07-01', amount: '1', currencyCode: 'USD' }], f.actor))
-      .rejects.toMatchObject({ response: { code: 'LEASE_NOT_MUTABLE' } });
+    // Milestone 3 — post-commencement schedule APPEND is the controlled addition
+    // this milestone introduces (previously rejected with LEASE_NOT_MUTABLE):
+    const appended = (await service.addSchedules(leaseId, [{ dueDate: '2031-07-01', amount: '1', currencyCode: 'USD' }], f.actor)) as Array<Record<string, unknown>>;
+    expect(appended.some((s) => s['dueDate'] === '2031-07-01')).toBe(true);
+    // structural schedule DELETION stays frozen after commencement (M3 preserves this)
     await expect(service.removeSchedule(leaseId, scheduleId, f.actor))
       .rejects.toMatchObject({ response: { code: 'LEASE_NOT_MUTABLE' } });
     // …while recording confirmed receipts against existing schedules is supported and documented

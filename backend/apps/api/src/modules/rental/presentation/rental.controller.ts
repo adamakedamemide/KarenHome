@@ -8,13 +8,21 @@ import type { AuthenticatedUser } from '@platform/contracts';
 import { RentalService } from '../application/rental.service';
 
 /**
- * Gate P — Rental API (Milestone 1: lease foundation).
+ * Gate P — Rental API (Milestone 1: lease foundation; Milestone 3: post-
+ * commencement schedule management).
  *
  * Exact-decimal money policy (repository-wide convention): every API decimal is
- * a STRING and validated with @IsNumberString — never a JS number, never a
- * float. The controller never converts amounts; values reach the numeric(20,4)
- * columns as the exact strings the client sent. Date columns are validated as
- * exact 'YYYY-MM-DD' strings (the frozen `date` columns; no timezone drift).
+ * a STRING — never a JS number, never a float. DTO-level string bounds carry
+ * the shape (@IsString + @Length, mirroring the RecordRentPaymentDto
+ * precedent); the exact numeric(20,4) contract (scale ≤ 4, ≤ 16 integer digits,
+ * deterministically handled leading zeros) is owned by ONE authoritative layer
+ * in the service (assertNonNegativeDecimalString for schedule amounts,
+ * assertPositiveDecimalString for receipt amounts) so a value that would
+ * require rounding is rejected with an explicit client domain error BEFORE
+ * anything is written — never rounded or truncated. The controller never
+ * converts amounts; values reach the numeric(20,4) columns as the exact
+ * strings the client sent. Date columns are validated as exact 'YYYY-MM-DD'
+ * strings (the frozen `date` columns; no timezone drift).
  */
 
 const LEASE_STATUS_VALUES = ['draft', 'pending_signature', 'active', 'expired', 'terminated', 'cancelled'] as const;
@@ -85,18 +93,104 @@ export class AddLeasePartiesDto {
 
 export class RentScheduleItemDto {
   /** Exact 'YYYY-MM-DD' (frozen date column); unique per lease. */
+  @ApiProperty({
+    type: 'string',
+    minLength: 10,
+    maxLength: 10,
+    description:
+      "Exact 'YYYY-MM-DD' due date (frozen date column). Unique per lease — the frozen UNIQUE (lease_id, due_date) " +
+      'is the concurrency-safe duplicate authority; a duplicate date is rejected with 409 LEASE_SCHEDULE_DUPLICATE.',
+    example: '2031-02-01',
+  })
   @IsString() @Length(10, 10) dueDate!: string;
-  /** >= 0 — exact decimal string (numeric(20,4) column); lease currency. */
-  @IsNumberString() amount!: string;
+  /**
+   * >= 0 — exact decimal string (numeric(20,4) column); lease currency.
+   * Milestone 3: the DTO deliberately carries @IsString, NOT @IsNumberString —
+   * the exact numeric(20,4) contract is owned by ONE authoritative layer:
+   * RentalService.assertNonNegativeDecimalString.
+   */
+  @ApiProperty({
+    type: 'string',
+    minLength: 1,
+    maxLength: 64,
+    description:
+      'Exact non-negative decimal amount as a STRING (never a JSON number). Exact numeric(20,4) contract: ' +
+      '1-64 characters, digits with an optional fractional part — no sign, exponent, grouping separators or whitespace; ' +
+      'at most 16 integer digits (harmless leading zeros are stripped deterministically) and at most 4 fractional digits ' +
+      '(maximum representable value 9999999999999999.9999). ZERO is valid (the frozen schedule CHECK is amount >= 0). ' +
+      'A value that would require rounding when persisted (more than 4 fractional digits) or exceeds the range is ' +
+      'rejected with 422 LEASE_SCHEDULE_AMOUNT_INVALID BEFORE anything is written — never rounded, truncated or capped. ' +
+      'Must equal the lease currency (422 LEASE_SCHEDULE_CURRENCY_MISMATCH on mismatch; no FX conversion).',
+    example: '1250.0000',
+  })
+  @IsString() @Length(1, 64) amount!: string;
   /** Must equal the lease currency (exact consistency, no conversion). */
-  @IsString() @Length(3) currencyCode!: string;
+  @ApiProperty({
+    type: 'string',
+    minLength: 3,
+    maxLength: 3,
+    description:
+      "Exactly 3 characters. Must equal the lease's own currency — no FX conversion is performed. " +
+      'Mismatch → 422 LEASE_SCHEDULE_CURRENCY_MISMATCH.',
+    example: 'EUR',
+  })
+  @IsString() @Length(3, 3) currencyCode!: string;
 }
 
 export class AddRentSchedulesDto {
+  @ApiProperty({
+    type: [RentScheduleItemDto],
+    minItems: 1,
+    maxItems: 200,
+    description:
+      'One to 200 schedule rows to add (validated as a whole — a request with any invalid row, duplicate date or ' +
+      'currency mismatch writes NOTHING).',
+  })
   @ArrayMinSize(1) @ArrayMaxSize(200)
   @ValidateNested({ each: true })
   @Type(() => RentScheduleItemDto)
   items!: RentScheduleItemDto[];
+}
+
+/**
+ * Milestone 3 — controlled amendment of a pristine schedule row. The request
+ * REPLACES the editable schedule fields (dueDate, amount). Currency is NOT a
+ * request field: it is immutable and always stays the lease currency. The
+ * pristine-state contract (parent lease draft | pending_signature | active;
+ * schedule status exactly 'scheduled'; paid_at NULL; zero recorded rent
+ * payments) is owned by RentalService.amendSchedule.
+ */
+export class AmendRentScheduleDto {
+  /** Exact 'YYYY-MM-DD' (frozen date column); unique per lease. */
+  @ApiProperty({
+    type: 'string',
+    minLength: 10,
+    maxLength: 10,
+    description:
+      "Exact 'YYYY-MM-DD' due date (frozen date column) REPLACING the schedule's due date. Unique per lease — the " +
+      'frozen UNIQUE (lease_id, due_date) is the concurrency-safe duplicate authority: amending onto a date that ' +
+      'another schedule row (or a concurrent amendment winner) already holds is rejected with ' +
+      '409 LEASE_SCHEDULE_DUPLICATE — exactly one concurrent winner.',
+    example: '2031-08-01',
+  })
+  @IsString() @Length(10, 10) dueDate!: string;
+  /** >= 0 — exact decimal string (numeric(20,4) column); lease currency (immutable). */
+  @ApiProperty({
+    type: 'string',
+    minLength: 1,
+    maxLength: 64,
+    description:
+      'Exact non-negative decimal amount as a STRING (never a JSON number) REPLACING the schedule amount. Exact ' +
+      'numeric(20,4) contract: 1-64 characters, digits with an optional fractional part — no sign, exponent, grouping ' +
+      'separators or whitespace; at most 16 integer digits (harmless leading zeros are stripped deterministically) and ' +
+      'at most 4 fractional digits (maximum representable value 9999999999999999.9999). ZERO is valid (the frozen ' +
+      'schedule CHECK is amount >= 0). A value that would require rounding when persisted (more than 4 fractional ' +
+      'digits) or exceeds the range is rejected with 422 LEASE_SCHEDULE_AMOUNT_INVALID BEFORE anything is written — ' +
+      'never rounded, truncated or capped. The currency is immutable: it is not part of this request and always ' +
+      'remains the lease currency. Only pristine schedules can be amended (422 LEASE_SCHEDULE_NOT_AMENDABLE otherwise).',
+    example: '1250.0000',
+  })
+  @IsString() @Length(1, 64) amount!: string;
 }
 
 /**
@@ -216,11 +310,160 @@ export class RentalController {
     return { data: await this.rental.listSchedules(id, user) };
   }
 
+  /**
+   * Milestone 3 — rent schedules are appendable while draft | pending_signature
+   * (unchanged M1 behavior) and controlled-appended while active;
+   * expired | terminated | cancelled leases reject additions. The lease row is
+   * re-read and locked FOR UPDATE inside the transaction, so a concurrent
+   * lifecycle move that commits first is honored (a new schedule can never be
+   * committed against a lease that is no longer active).
+   */
+  @ApiOperation({
+    summary: 'Add rent schedules to a lease',
+    description:
+      'Adds rent-schedule rows (exact due date, exact non-negative decimal amount, lease currency) to the lease. ' +
+      'Pre-commencement leases (draft | pending_signature) keep the unchanged behavior; ACTIVE leases accept ' +
+      'controlled post-commencement additions (every new row carries the lease currency and the frozen database ' +
+      'default status — no status transition is invented); expired | terminated | cancelled leases REJECT additions. ' +
+      'The lease row is re-read and locked FOR UPDATE inside the write transaction, so a concurrent lifecycle move ' +
+      'that commits first is honored and a new schedule can never be committed against a lease that is no longer ' +
+      'active. Amounts follow the exact numeric(20,4) contract (values that would require rounding are rejected ' +
+      'BEFORE any database access — never rounded or truncated). Org-scoped: requires the rental.update permission ' +
+      '(rental.manage implied) within the landlord organization; out-of-scope identifiers answer 404 without ' +
+      'leaking existence.',
+  })
+  @ApiResponse({
+    status: 201,
+    description:
+      'Schedules added. Returns { data: [ schedule, ... ] } — every lease schedule row (exact decimal strings ' +
+      'end-to-end; status is the frozen database default). A rental.schedules_added audit record is written in the ' +
+      'SAME transaction with the actor, landlord organization, lease ID, due dates, exact amounts and currency; ' +
+      'schedule sub-resource changes carry audit only (no outbox event).',
+  })
+  @ApiResponse({ status: 400, description: 'Request body validation failed (unknown/forbidden properties rejected by the validation pipe).' })
+  @ApiResponse({ status: 403, description: 'Authenticated but missing the required rental.update (or rental.manage) permission in the landlord organization.' })
+  @ApiResponse({
+    status: 404,
+    description: 'LEASE_NOT_FOUND — the lease does not exist or is outside the caller scope (existence is never leaked).',
+  })
+  @ApiResponse({
+    status: 409,
+    description:
+      'LEASE_SCHEDULE_DUPLICATE — the same (lease_id, due_date) already exists (frozen UNIQUE authority; a duplicate ' +
+      'date inside one request or a concurrent winner both map here).',
+  })
+  @ApiResponse({
+    status: 422,
+    description:
+      'Domain rejection (code-based error model): LEASE_SCHEDULE_AMOUNT_INVALID (exact non-negative numeric(20,4) ' +
+      'contract violated, including any value that would require rounding); LEASE_SCHEDULE_CURRENCY_MISMATCH (every ' +
+      'schedule must use the lease currency — no FX); LEASE_NOT_MUTABLE (the lease is expired | terminated | ' +
+      'cancelled, or the locked re-read lost the race against a concurrent lifecycle move).',
+  })
   @Post('leases/:id/schedules')
   async addSchedules(@Param('id') id: string, @Body() dto: AddRentSchedulesDto, @CurrentUser() user: AuthenticatedUser) {
     return { data: await this.rental.addSchedules(id, dto.items, user) };
   }
 
+  /**
+   * Milestone 3 — controlled amendment of a pristine schedule row. Deletion is
+   * NOT extended to active leases by this milestone (see removeSchedule).
+   */
+  @ApiOperation({
+    summary: 'Amend a pristine rent schedule (due date and amount)',
+    description:
+      'Replaces the editable schedule fields (dueDate, amount) of a PRISTINE rent schedule. The currency is ' +
+      'immutable and always remains the lease currency (it is not part of the request and the column is never ' +
+      'written). An amendment is allowed only when ALL of the following hold: the parent lease is ' +
+      'draft | pending_signature | active; the schedule status is exactly scheduled (pending, late, partially_paid, ' +
+      'paid, waived and cancelled schedules are NEVER reopened or modified); paid_at is NULL; and there are ZERO rows ' +
+      'in rent_payments — a pristine amendment must never alter a receipt, a payment amount or a reconciled schedule. ' +
+      'Amounts follow the exact numeric(20,4) non-negative contract (values that would require rounding are rejected ' +
+      'BEFORE any database access). Concurrency-safe: the lease row is locked FOR UPDATE first, then the schedule row ' +
+      'FOR UPDATE (the same schedule-row lock discipline the rent-payment recording path uses), and every state ' +
+      'invariant is re-validated under the locks — a receipt recorder and a schedule amendment serialize on the ' +
+      'schedule row and never both commit based on stale assumptions; concurrent due-date changes resolve through ' +
+      'the frozen UNIQUE (lease_id, due_date) with exactly one winner. A failed transaction leaves NO schedule ' +
+      'mutation and NO audit record. Org-scoped: requires the rental.update permission (rental.manage implied) ' +
+      'within the landlord organization; out-of-scope identifiers answer 404 without leaking existence.',
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Schedule amended. Returns { data: { id, leaseId, dueDate, amount, currencyCode, status, paidAt } } with exact ' +
+      'decimal strings end-to-end and the currency unchanged. A rental.schedule_amended audit record with before/after ' +
+      'state (due date, exact amounts, currency, status, paid_at) is written in the SAME transaction; schedule ' +
+      'sub-resource changes carry audit only (no outbox event).',
+  })
+  @ApiResponse({ status: 400, description: 'Request body validation failed (unknown/forbidden properties rejected by the validation pipe).' })
+  @ApiResponse({ status: 403, description: 'Authenticated but missing the required rental.update (or rental.manage) permission in the landlord organization.' })
+  @ApiResponse({
+    status: 404,
+    description:
+      'LEASE_NOT_FOUND / LEASE_SCHEDULE_NOT_FOUND — the lease or schedule does not exist or is outside the caller ' +
+      'scope (existence is never leaked).',
+  })
+  @ApiResponse({
+    status: 409,
+    description:
+      'LEASE_SCHEDULE_DUPLICATE — the target (lease_id, due_date) is already taken by another schedule row (frozen ' +
+      'UNIQUE authority; concurrent due-date changes resolve with exactly one winner); ' +
+      'LEASE_SCHEDULE_CONCURRENT_MODIFICATION — defensive guard against a stale write under the row lock.',
+  })
+  @ApiResponse({
+    status: 422,
+    description:
+      'Domain rejection (code-based error model): LEASE_SCHEDULE_AMOUNT_INVALID (exact non-negative numeric(20,4) ' +
+      'contract violated, including any value that would require rounding); LEASE_SCHEDULE_NOT_AMENDABLE (the parent ' +
+      'lease is not draft | pending_signature | active, the schedule status is not exactly scheduled, paid_at is set, ' +
+      'or recorded rent payments exist); LEASE_SCHEDULE_RANGE_INVALID (frozen CHECK amount >= 0 is the DB authority).',
+  })
+  @Put('leases/:id/schedules/:scheduleId')
+  async amendSchedule(
+    @Param('id') id: string,
+    @Param('scheduleId') scheduleId: string,
+    @Body() dto: AmendRentScheduleDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return { data: await this.rental.amendSchedule(id, scheduleId, dto, user) };
+  }
+
+  /**
+   * Pre-commencement schedule deletion ONLY (M1 semantics preserved by M3):
+   * draft | pending_signature leases delete unpaid schedule rows; active |
+   * expired | terminated | cancelled leases get the documented LEASE_NOT_MUTABLE
+   * domain rejection — no active-lease schedule deletion or cancellation is
+   * introduced, and the frozen ON DELETE RESTRICT relationship to rent payments
+   * stays the authoritative guard against removing receipt-bearing rows.
+   */
+  @ApiOperation({
+    summary: 'Remove a pre-commencement rent schedule',
+    description:
+      'Deletes an UNPAID schedule row from a pre-commencement lease (draft | pending_signature). For an active, ' +
+      'expired, terminated or cancelled lease this is REJECTED with 422 LEASE_NOT_MUTABLE — historical and active ' +
+      'contractual obligations are never hard-deleted, and this milestone introduces no active-lease schedule ' +
+      'deletion or cancellation. A schedule that already carries recorded rent payments is protected by the frozen ' +
+      'ON DELETE RESTRICT relationship (409 LEASE_SCHEDULE_IN_USE).',
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Schedule removed. Returns { data: { id, leaseId, dueDate, amount, currencyCode, status, paidAt } } (the removed ' +
+      'row snapshot). A rental.schedule_removed audit record with the before-snapshot is written in the SAME transaction.',
+  })
+  @ApiResponse({ status: 403, description: 'Authenticated but missing the required rental.update (or rental.manage) permission in the landlord organization.' })
+  @ApiResponse({
+    status: 404,
+    description: 'LEASE_NOT_FOUND / LEASE_SCHEDULE_NOT_FOUND — the lease or schedule does not exist or is outside the caller scope (existence is never leaked).',
+  })
+  @ApiResponse({
+    status: 409,
+    description: 'LEASE_SCHEDULE_IN_USE — the schedule carries recorded rent payments (frozen ON DELETE RESTRICT authority).',
+  })
+  @ApiResponse({
+    status: 422,
+    description: 'LEASE_NOT_MUTABLE — the lease is active | expired | terminated | cancelled; pre-commencement deletion only.',
+  })
   @Delete('leases/:id/schedules/:scheduleId')
   async removeSchedule(@Param('id') id: string, @Param('scheduleId') scheduleId: string, @CurrentUser() user: AuthenticatedUser) {
     return { data: await this.rental.removeSchedule(id, scheduleId, user) };
